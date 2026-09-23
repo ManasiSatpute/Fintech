@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bond Trade Extraction</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+  <!-- Top Header -->
+  <header>
+    <div>
+      <div class="brand-title">Bond Trade Extraction</div>
+      <div class="brand-subtitle">
+        Structured SQL Records from WhatsApp Chat Exports
+      </div>
+    </div>
+
+    <div class="header-actions">
+      <button class="btn btn-secondary" onclick="openDbViewer()">
+        Database Records
+      </button>
+
+      <button class="btn btn-secondary" onclick="resetChat()">
+        Clear Chat
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Chat Flow -->
+  <main>
+    <div class="chat-stream" id="chatStream">
+
+      <div class="chat-message assistant">
+        <div class="avatar avatar-assistant">AI</div>
+
+        <div class="message-content">
+          <div class="bubble bubble-assistant">
+            <strong>Bond Trade Extraction System</strong><br>
+
+            Upload a WhatsApp chat export (.txt or .json)
+            using the attachment button below.
+
+            <ol style="margin: 8px 0 0 18px; line-height: 1.6;">
+              <li>Parse raw chat export and stitch messages</li>
+              <li>Filter noise and detect trade negotiation bursts</li>
+              <li>Extract bond terms, parties, quantity, price, and settlement</li>
+              <li>Validate business rules and persist atomically to SQLite database</li>
+            </ol>
+          </div>
+
+          <div class="message-time">System ready</div>
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+  <!-- Input Bar -->
+  <div class="input-bar">
+    <div class="input-container">
+
+      <input
+        type="file"
+        id="fileUploadInput"
+        accept=".txt,.json,.log"
+        style="display: none;"
+        onchange="handleFileUpload(this.files[0])"
+      >
+
+      <button
+        class="btn-attach"
+        onclick="document.getElementById('fileUploadInput').click()"
+        title="Select chat export file"
+      >
+        <svg
+          class="file-icon-svg"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+        >
+          <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+        </svg>
+      </button>
+
+      <input
+        type="text"
+        class="text-input-field"
+        placeholder="Select a WhatsApp chat export file (.txt or .json)..."
+        readonly
+        onclick="document.getElementById('fileUploadInput').click()"
+      >
+
+      <button
+        class="btn btn-primary"
+        onclick="document.getElementById('fileUploadInput').click()"
+      >
+        Upload File
+      </button>
+
+    </div>
+  </div>
+
+  <!-- Database Inspector Modal -->
+  <div class="modal-backdrop" id="dbModal">
+
+    <div class="modal-dialog">
+
+      <div class="modal-header">
+        <h2>SQLite Database Records</h2>
+
+        <button
+          class="modal-close-btn"
+          onclick="closeDbViewer()"
+        >
+          &times;
+        </button>
+      </div>
+
+      <div class="modal-nav">
+
+        <button
+          class="nav-tab active"
+          id="tabTransactions"
+          onclick="switchTab('transactions')"
+        >
+          Transactions (<span id="countTx">0</span>)
+        </button>
+
+        <button
+          class="nav-tab"
+          id="tabBonds"
+          onclick="switchTab('bonds')"
+        >
+          Bonds (<span id="countBonds">0</span>)
+        </button>
+
+        <button
+          class="nav-tab"
+          id="tabMessages"
+          onclick="switchTab('messages')"
+        >
+          Messages (<span id="countMsgs">0</span>)
+        </button>
+
+      </div>
+
+      <div class="modal-content" id="modalTableBody">
+        <p style="color: var(--text-tertiary);">
+          Loading records...
+        </p>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    let currentUploadId = null;
+    let databaseCache = null;
+    let activeTab = 'transactions';
+
+    function scrollToBottom() {
+      window.scrollTo({
+        top: document.body.scrollHeight,
+        behavior: 'smooth'
+      });
+    }
+
+    function resetChat() {
+      currentUploadId = null;
+
+      document.getElementById('chatStream').innerHTML = `
+        <div class="chat-message assistant">
+          <div class="avatar avatar-assistant">AI</div>
+
+          <div class="message-content">
+            <div class="bubble bubble-assistant">
+              Chat session cleared. Upload a WhatsApp chat export
+              (.txt or .json) to begin.
+            </div>
+
+            <div class="message-time">
+              ${new Date().toLocaleTimeString()}
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function appendMessage(htmlContent, isUser = false) {
+      const container = document.getElementById('chatStream');
+
+      const div = document.createElement('div');
+
+      div.className = `chat-message ${
+        isUser ? 'user' : 'assistant'
+      }`;
+
+      const timeStr = new Date().toLocaleTimeString();
+
+      const avatarHtml = isUser
+        ? `<div class="avatar avatar-user">You</div>`
+        : `<div class="avatar avatar-assistant">AI</div>`;
+
+      div.innerHTML = `
+        ${avatarHtml}
+
+        <div class="message-content">
+          <div class="bubble ${
+            isUser ? 'bubble-user' : 'bubble-assistant'
+          }">
+            ${htmlContent}
+          </div>
+
+          <div class="message-time">
+            ${timeStr}
+          </div>
+        </div>
+      `;
+
+      container.appendChild(div);
+
+      scrollToBottom();
+
+      return div;
+    }
+
+    function showStatus(text) {
+      removeStatus();
+
+      const container = document.getElementById('chatStream');
+
+      const div = document.createElement('div');
+
+      div.className = 'chat-message assistant';
+      div.id = 'statusMsg';
+
+      div.innerHTML = `
+        <div class="avatar avatar-assistant">AI</div>
+
+        <div class="message-content">
+          <div class="bubble bubble-assistant">
+            <span class="loading-pulse">
+              ${escapeHtml(text)}
+            </span>
+          </div>
+        </div>
+      `;
+
+      container.appendChild(div);
+
+      scrollToBottom();
+    }
+
+    function removeStatus() {
+      const el = document.getElementById('statusMsg');
+
+      if (el) {
+        el.remove();
+      }
+    }
+
+    const sleep = ms =>
+      new Promise(resolve => setTimeout(resolve, ms));
+
+    async function handleFileUpload(file) {
+      if (!file) return;
+
+      // 1. User Message: Uploaded file
+      const sizeKb = (file.size / 1024).toFixed(1);
+
+      const userHtml = `
+        <div class="file-attachment-card">
+
+          <svg
+            class="file-icon-svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+          </svg>
+
+          <div>
+            <div class="file-meta-name">
+              ${escapeHtml(file.name)}
+            </div>
+
+            <div class="file-meta-sub">
+              ${sizeKb} KB • WhatsApp Export
+            </div>
+          </div>
+
+        </div>
+      `;
+
+      appendMessage(userHtml, true);
+
+      // 2. Parse Step
+      showStatus("Parsing messages from export...");
+
+      await sleep(350);
+
+      const formData = new FormData();
+
+      formData.append("file", file);
+
+      try {
+        const uploadRes = await fetch("/upload", {
+          method: "POST",
+          body: formData
+        });
+
+        if (!uploadRes.ok) {
+          throw new Error(await uploadRes.text());
+        }
+
+        const data = await uploadRes.json();
+
+        removeStatus();
+
+        await runPipeline(data);
+
+      } catch (err) {
+        removeStatus();
+
+        appendMessage(`
+          <strong>Upload Error:</strong>
+          ${escapeHtml(err.message)}
+        `);
+      }
+    }
+
+    async function runPipeline(uploadData) {
+      currentUploadId = uploadData.upload_id;
+
+      // 3. Show parsed messages table
+      let tableRows = '';
+
+      uploadData.messages.slice(0, 25).forEach(m => {
+
+        const time = m.timestamp
+          ? m.timestamp
+              .replace('T', ' ')
+              .substring(11, 19)
+          : '--:--';
+
+        const sender = m.sender || 'Unknown';
+
+        const text = m.message_text.length > 90
+          ? m.message_text.substring(0, 90) + '...'
+          : m.message_text;
+
+        tableRows += `
+          <tr>
+            <td class="mono-cell">
+              ${time}
+            </td>
+
+            <td>
+              <span class="sender-tag">
+                ${escapeHtml(sender)}
+              </span>
+            </td>
+
+            <td>
+              ${escapeHtml(text)}
+            </td>
+          </tr>
+        `;
+      });
+
+      const parsedHtml = `
+        <div>
+
+          <strong>
+            Parsed ${uploadData.parsed_count} messages
+          </strong>
+
+          from
+          <code>${escapeHtml(uploadData.filename)}</code>.
+
+          <div class="table-wrapper">
+
+            <table class="data-table">
+
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Sender</th>
+                  <th>Message</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                ${tableRows}
+              </tbody>
+
+            </table>
+
+          </div>
+        </div>
+      `;
+
+      appendMessage(parsedHtml);
+
+      await sleep(400);
+
+      // 4. Extraction
+      showStatus(
+        "Filtering noise and extracting trade details..."
+      );
+
+      try {
+
+        const extractRes = await fetch(
+          `/extract/${currentUploadId}`,
+          {
+            method: "POST"
+          }
+        );
+
+        if (!extractRes.ok) {
+          throw new Error(await extractRes.text());
+        }
+
+        const extractData = await extractRes.json();
+
+        removeStatus();
+
+        appendMessage(`
+          Filtered system noise. Found
+          <strong>
+            ${extractData.trade_contexts_count}
+          </strong>
+          trade negotiation context(s).
+        `);
+
+        await sleep(400);
+
+        // Extracted Trades Card
+        let dealsHtml = '';
+
+        if (
+          !extractData.extractions ||
+          extractData.extractions.length === 0
+        ) {
+
+          dealsHtml = `
+            <p
+              style="
+                color: var(--text-tertiary);
+                font-size: 0.85rem;
+                margin-top: 6px;
+              "
+            >
+              No confirmed bond trades identified in this
+              conversation.
+            </p>
+          `;
+
+        } else {
+
+          extractData.extractions.forEach(d => {
+
+            const status = d.status || 'INCOMPLETE';
+
+            let badgeClass = 'badge-incomplete';
+
+            if (status === 'CONCLUDED') {
+              badgeClass = 'badge-concluded';
+            } else if (status === 'DISCARDED') {
+              badgeClass = 'badge-discarded';
+            }
+
+            const bond =
+              d.bond_identity || 'Bond Unspecified';
+
+            const isin = d.isin
+              ? ` (ISIN: ${d.isin})`
+              : '';
+
+            const qty = d.quantity
+              ? `${d.quantity} ${d.quantity_unit || 'Cr'}`
+              : '—';
+
+            const price =
+              d.final_price !== null &&
+              d.final_price !== undefined
+                ? `${d.final_price}`
+                : '—';
+
+            const ytm = d.ytm
+              ? `${d.ytm}%`
+              : '—';
+
+            const settlement =
+              d.settlement_reference || 'T1';
+
+            dealsHtml += `
+              <div class="deal-card">
+
+                <div class="deal-card-header">
+
+                  <div class="deal-title">
+                    ${escapeHtml(bond)}
+                    ${escapeHtml(isin)}
+                  </div>
+
+                  <span class="badge ${badgeClass}">
+                    ${status}
+                  </span>
+
+                </div>
+
+                <div class="deal-grid">
+
+                  <div class="spec-item">
+                    <span class="spec-label">
+                      Buyer
+                    </span>
+
+                    <span class="spec-value">
+                      ${escapeHtml(d.buyer || '—')}
+                    </span>
+                  </div>
+
+                  <div class="spec-item">
+                    <span class="spec-label">
+                      Seller
+                    </span>
+
+                    <span class="spec-value">
+                      ${escapeHtml(d.seller || '—')}
+                    </span>
+                  </div>
+
+                  <div class="spec-item">
+                    <span class="spec-label">
+                      Quantity
+                    </span>
+
+                    <span class="spec-value highlight">
+                      ${escapeHtml(qty)}
+                    </span>
+                  </div>
+
+                  <div class="spec-item">
+                    <span class="spec-label">
+                      Price / Yield
+                    </span>
+
+                    <span class="spec-value highlight">
+                      ${escapeHtml(price)}
+                    </span>
+                  </div>
+
+                  <div class="spec-item">
+                    <span class="spec-label">
+                      YTM
+                    </span>
+
+                    <span class="spec-value">
+                      ${escapeHtml(ytm)}
+                    </span>
+                  </div>
+
+                  <div class="spec-item">
+                    <span class="spec-label">
+                      Settlement
+                    </span>
+
+                    <span class="spec-value">
+                      ${escapeHtml(settlement)}
+                    </span>
+                  </div>
+
+                </div>
+              </div>
+            `;
+          });
+        }
+
+        appendMessage(`
+          <strong>Extracted Trade Records:</strong>
+          ${dealsHtml}
+        `);
+
+        await sleep(400);
+
+        // Store in DB
+        showStatus(
+          "Storing records into SQLite database..."
+        );
+
+        const storeRes = await fetch(
+          `/store/${currentUploadId}`,
+          {
+            method: "POST"
+          }
+        );
+
+        if (!storeRes.ok) {
+          throw new Error(await storeRes.text());
+        }
+
+        const storeData = await storeRes.json();
+
+        removeStatus();
+
+        // Final confirmation
+        appendMessage(`
+          <div>
+
+            <strong>Stored successfully</strong> —
+
+            ${storeData.messages_stored} messages,
+            ${storeData.bonds_stored} bonds, and
+            ${storeData.transactions_stored} transactions
+            saved to database.
+
+            <div style="margin-top: 10px;">
+
+              <button
+                class="btn btn-primary"
+                onclick="openDbViewer()"
+              >
+                View Database Records
+              </button>
+
+            </div>
+
+          </div>
+        `);
+
+      } catch (err) {
+
+        removeStatus();
+
+        appendMessage(`
+          <strong>Extraction Error:</strong>
+          ${escapeHtml(err.message)}
+        `);
+      }
+    }
+
+    // Modal Database Viewer
+    async function openDbViewer() {
+      document
+        .getElementById('dbModal')
+        .classList.add('active');
+
+      await loadDbData();
+    }
+
+    function closeDbViewer() {
+      document
+        .getElementById('dbModal')
+        .classList.remove('active');
+    }
+
+    async function loadDbData() {
+
+      const container =
+        document.getElementById('modalTableBody');
+
+      container.innerHTML = `
+        <p style="color: var(--text-tertiary);">
+          Loading records...
+        </p>
+      `;
+
+      try {
+
+        const res = await fetch("/data");
+
+        if (!res.ok) {
+          throw new Error(await res.text());
+        }
+
+        databaseCache = await res.json();
+
+        document.getElementById('countTx').textContent =
+          databaseCache.counts.transactions;
+
+        document.getElementById('countBonds').textContent =
+          databaseCache.counts.bonds;
+
+        document.getElementById('countMsgs').textContent =
+          databaseCache.counts.messages;
+
+        renderTab();
+
+      } catch (err) {
+
+        container.innerHTML = `
+          <p style="color: var(--danger);">
+            Failed to load database:
+            ${escapeHtml(err.message)}
+          </p>
+        `;
+      }
+    }
+
+    function switchTab(tab) {
+
+      activeTab = tab;
+
+      document
+        .querySelectorAll('.nav-tab')
+        .forEach(t => t.classList.remove('active'));
+
+      if (tab === 'transactions') {
+        document
+          .getElementById('tabTransactions')
+          .classList.add('active');
+      }
+
+      if (tab === 'bonds') {
+        document
+          .getElementById('tabBonds')
+          .classList.add('active');
+      }
+
+      if (tab === 'messages') {
+        document
+          .getElementById('tabMessages')
+          .classList.add('active');
+      }
+
+      renderTab();
+    }
+
+    function renderTab() {
+
+      if (!databaseCache) return;
+
+      const container =
+        document.getElementById('modalTableBody');
+
+      if (activeTab === 'transactions') {
+
+        const rows =
+          databaseCache.transactions || [];
+
+        if (rows.length === 0) {
+
+          container.innerHTML = `
+            <p style="color: var(--text-tertiary);">
+              No transaction records found in database.
+            </p>
+          `;
+
+          return;
+        }
+
+        let tbody = rows.map(r => `
+          <tr>
+
+            <td class="mono-cell">
+              ${r.transaction_id.substring(0, 8)}...
+            </td>
+
+            <td>
+              <strong>
+                ${escapeHtml(
+                  r.bond_identity ||
+                  r.bond_id.substring(0, 8)
+                )}
+              </strong>
+            </td>
+
+            <td>
+              ${escapeHtml(r.buyer || '—')}
+            </td>
+
+            <td>
+              ${escapeHtml(r.seller || '—')}
+            </td>
+
+            <td class="mono-cell">
+              ${
+                r.quantity
+                  ? r.quantity + ' ' +
+                    (r.quantity_unit || '')
+                  : '—'
+              }
+            </td>
+
+            <td class="mono-cell">
+              ${
+                r.final_price !== null &&
+                r.final_price !== undefined
+                  ? r.final_price
+                  : '—'
+              }
+            </td>
+
+            <td>
+              ${r.settlement_reference || 'T1'}
+            </td>
+
+            <td>
+              <span
+                class="badge ${
+                  r.status === 'CONCLUDED'
+                    ? 'badge-concluded'
+                    : 'badge-incomplete'
+                }"
+              >
+                ${r.status}
+              </span>
+            </td>
+
+            <td class="mono-cell">
+              ${
+                r.created_at
+                  ? r.created_at
+                      .substring(0, 19)
+                      .replace('T', ' ')
+                  : '—'
+              }
+            </td>
+
+          </tr>
+        `).join('');
+
+        container.innerHTML = `
+          <div
+            class="table-wrapper"
+            style="max-height: 52vh;"
+          >
+
+            <table class="data-table">
+
+              <thead>
+                <tr>
+                  <th>Tx ID</th>
+                  <th>Bond</th>
+                  <th>Buyer</th>
+                  <th>Seller</th>
+                  <th>Quantity</th>
+                  <th>Price</th>
+                  <th>Settlement</th>
+                  <th>Status</th>
+                  <th>Created</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                ${tbody}
+              </tbody>
+
+            </table>
+
+          </div>
+        `;
+
+      } else if (activeTab === 'bonds') {
+
+        const rows =
+          databaseCache.bonds || [];
+
+        if (rows.length === 0) {
+
+          container.innerHTML = `
+            <p style="color: var(--text-tertiary);">
+              No bond records found in database.
+            </p>
+          `;
+
+          return;
+        }
+
+        let tbody = rows.map(r => `
+          <tr>
+
+            <td class="mono-cell">
+              ${r.bond_id.substring(0, 8)}...
+            </td>
+
+            <td>
+              <strong>
+                ${escapeHtml(r.bond_identity)}
+              </strong>
+            </td>
+
+            <td class="mono-cell">
+              ${escapeHtml(r.isin || '—')}
+            </td>
+
+            <td>
+              ${escapeHtml(r.identity_type)}
+            </td>
+
+            <td>
+              ${escapeHtml(r.issuer_name || '—')}
+            </td>
+
+            <td>
+              ${escapeHtml(r.credit_rating || '—')}
+            </td>
+
+            <td class="mono-cell">
+              ${
+                r.coupon_rate
+                  ? r.coupon_rate + '%'
+                  : '—'
+              }
+            </td>
+
+            <td class="mono-cell">
+              ${escapeHtml(r.maturity_date || '—')}
+            </td>
+
+          </tr>
+        `).join('');
+
+        container.innerHTML = `
+          <div
+            class="table-wrapper"
+            style="max-height: 52vh;"
+          >
+
+            <table class="data-table">
+
+              <thead>
+                <tr>
+                  <th>Bond ID</th>
+                  <th>Bond Identity</th>
+                  <th>ISIN</th>
+                  <th>Type</th>
+                  <th>Issuer</th>
+                  <th>Rating</th>
+                  <th>Coupon</th>
+                  <th>Maturity</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                ${tbody}
+              </tbody>
+
+            </table>
+
+          </div>
+        `;
+
+      } else if (activeTab === 'messages') {
+
+        const rows =
+          databaseCache.messages || [];
+
+        if (rows.length === 0) {
+
+          container.innerHTML = `
+            <p style="color: var(--text-tertiary);">
+              No message records found in database.
+            </p>
+          `;
+
+          return;
+        }
+
+        let tbody = rows.map(r => `
+          <tr>
+
+            <td class="mono-cell">
+              ${
+                r.timestamp
+                  ? r.timestamp
+                      .replace('T', ' ')
+                      .substring(0, 19)
+                  : '—'
+              }
+            </td>
+
+            <td>
+              <span class="sender-tag">
+                ${escapeHtml(r.sender)}
+              </span>
+            </td>
+
+            <td>
+              ${escapeHtml(r.message_text)}
+            </td>
+
+            <td class="mono-cell">
+              ${
+                r.transaction_id
+                  ? r.transaction_id.substring(0, 8) + '...'
+                  : '<span style="color: #94a3b8;">null</span>'
+              }
+            </td>
+
+          </tr>
+        `).join('');
+
+        container.innerHTML = `
+          <div
+            class="table-wrapper"
+            style="max-height: 52vh;"
+          >
+
+            <table class="data-table">
+
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Sender</th>
+                  <th>Message Text</th>
+                  <th>Linked Tx ID</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                ${tbody}
+              </tbody>
+
+            </table>
+
+          </div>
+        `;
+      }
+    }
+
+    function escapeHtml(str) {
+
+      if (!str) return '';
+
+      return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+  </script>
+
+</body>
+</html>

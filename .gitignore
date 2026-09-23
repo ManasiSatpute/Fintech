@@ -1,0 +1,19 @@
+# Virtual environments
+.venv/
+.venvWhatsapp/
+venv/
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Databases (generated at runtime)
+*.db
+Whatsaapp_to_Sql*
+
+# Private data
+chat_2.txt
+
+# OS / editor
+.DS_Store

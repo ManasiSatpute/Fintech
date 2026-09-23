@@ -1,11 +1,11 @@
 import sqlite3
 
-DB_PATH = "bond_deals_2.db"  # update path if needed
+DB_PATH = "Whatsaapp_to_Sql\\bond_deals.db"  # update path if needed
 
 conn = sqlite3.connect(DB_PATH)
 conn.row_factory = sqlite3.Row  # lets us access columns by name
 
-rows = conn.execute("SELECT * FROM bond_deals_2").fetchall()
+rows = conn.execute("SELECT * FROM bond_deals").fetchall()
 
 if not rows:
     print("No records found.")
