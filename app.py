@@ -11,6 +11,7 @@ Connects the Chat-style UI to the Python backend with:
 
 import os
 import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -111,6 +112,7 @@ async def extract_trades(upload_id: str):
     if not parsed_messages:
         return {
             "upload_id": upload_id,
+            "prompt_version": pipeline.PROMPT_VERSION,
             "trade_contexts_count": 0,
             "extractions": [],
             "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -130,6 +132,7 @@ async def extract_trades(upload_id: str):
     if not contexts:
         return {
             "upload_id": upload_id,
+            "prompt_version": pipeline.PROMPT_VERSION,
             "trade_contexts_count": 0,
             "skipped_low_relevance": len(skipped_low_relevance),
             "message": "No bond-relevant trade negotiation contexts detected in chat.",
@@ -155,7 +158,7 @@ async def extract_trades(upload_id: str):
     )
 
     for ctx in selected_contexts:
-        deal_or_deals, tokens = pipeline.call_llm_extraction(ctx["snippet_text"])
+        extraction_result, tokens = pipeline.call_llm_extraction(ctx["snippet_text"])
 
         prompt_tk = tokens.get("prompt_tokens", 0)
         compl_tk = tokens.get("completion_tokens", 0)
@@ -166,18 +169,39 @@ async def extract_trades(upload_id: str):
         if tot_tk > max_single_call_tokens:
             max_single_call_tokens = tot_tk
 
-        deals_list = deal_or_deals if isinstance(deal_or_deals, list) else [deal_or_deals]
+        if extraction_result.get("extraction_failed"):
+            failed_result = dict(extraction_result)
+            failed_result["context_id"] = ctx["context_id"]
+            failed_result["group_name"] = ctx.get("group_name", "Default")
+            failed_result["message_indices"] = ctx["message_indices"]
+            failed_result["snippet_text"] = ctx["snippet_text"]
+            failed_result["call_tokens"] = tokens
+            extractions.append(failed_result)
+            continue
 
-        for deal in deals_list:
+        for deal in extraction_result.get("deals", []):
             if not isinstance(deal, dict):
                 continue
             # Step 7: Validate business rules
-            validated_deal = pipeline.validate_extraction(deal)
+            context_datetime = max(
+                (
+                    message["dt"]
+                    for message in ctx["messages"]
+                    if isinstance(message.get("dt"), datetime)
+                ),
+                default=None,
+            )
+            validated_deal = pipeline.validate_extraction(
+                deal,
+                context_snippet=ctx["snippet_text"],
+                message_datetime=context_datetime,
+            )
             validated_deal["context_id"] = ctx["context_id"]
             validated_deal["group_name"] = ctx.get("group_name", "Default")
             validated_deal["message_indices"] = ctx["message_indices"]
             validated_deal["snippet_text"] = ctx["snippet_text"]
             validated_deal["call_tokens"] = tokens
+            validated_deal["prompt_version"] = extraction_result["prompt_version"]
 
             extractions.append(validated_deal)
 
@@ -213,6 +237,7 @@ async def extract_trades(upload_id: str):
         "total_contexts_detected": len(contexts),
         "skipped_low_relevance": len(skipped_low_relevance),
         "extractions": extractions,
+        "prompt_version": pipeline.PROMPT_VERSION,
         "token_usage": token_usage,
         "context_window": context_window,
     }
@@ -230,6 +255,17 @@ async def store_extracted_data(upload_id: str):
 
     parsed_messages = session.get("parsed_messages", [])
     extractions = session.get("extractions", [])
+    if any(
+        "bond_identity_text" in deal or "extraction_failed" in deal
+        for deal in extractions
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The current database schema cannot store the new extraction "
+                "format yet; no extracted deals were stored."
+            ),
+        )
 
     try:
         counts = db.persist_upload(

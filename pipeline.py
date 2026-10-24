@@ -15,13 +15,21 @@ import unicodedata
 import uuid
 from collections import Counter
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import ollama
 from langchain_ollama import ChatOllama
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 import config
+from normalize import (
+    normalize_maturity,
+    normalize_quantity,
+    normalize_yield_coupon,
+    resolve_settlement,
+)
 
 MODEL_NAME = config.MODEL_NAME
 ISSUER_ALIASES_PATH = Path(__file__).with_name("issuer_aliases.json")
@@ -56,6 +64,13 @@ def load_lexicon(path: Path = LEXICON_PATH) -> Dict[str, List[str]]:
 
 
 LEXICON = load_lexicon()
+EXTRACTION_EXAMPLES_PATH = Path(__file__).with_name("extraction_examples.json")
+with EXTRACTION_EXAMPLES_PATH.open(encoding="utf-8") as examples_file:
+    EXTRACTION_EXAMPLES = json.load(examples_file)
+if not isinstance(EXTRACTION_EXAMPLES, list) or len(EXTRACTION_EXAMPLES) != 4:
+    raise ValueError(
+        f"Expected four extraction examples in {EXTRACTION_EXAMPLES_PATH}"
+    )
 
 
 def _normalize_lexicon_text(value: Any) -> str:
@@ -1019,40 +1034,111 @@ def format_context_snippet(
 # 4. LLM EXTRACTION & TOKEN / CONTEXT METRICS
 # --------------------------------------------------------------------------
 
-EXTRACTION_SYSTEM_PROMPT = """You are an expert bond-trade extraction specialist for a fintech trading desk.
-You are given a WhatsApp conversation window between counterparties / brokers negotiating a bond trade.
+PROMPT_VERSION = "bond-extraction-v2"
 
-Your task is to extract structured bond trade details into a strict JSON object.
 
-Fields required in JSON:
-- bond_identity: string (e.g., "6.65% GS 2026", "9.60% Oxyzo June 27", "7.18% SDL 2028")
-- isin: string or null (12-character ISIN if explicitly present in the text, e.g. "INE04VS07438", otherwise null)
-- identity_type: one of "ISIN", "CUSIP", "SERIES", "NAME_ONLY", "UNKNOWN" (use "ISIN" if ISIN provided, "SERIES" or "NAME_ONLY" for named bonds)
-- issuer_name: string or null (e.g. "Government of India", "Oxyzo", "State Government", "HUDCO")
-- credit_rating: string or null (e.g. "AAA", "A+", "Sovereign", or null)
-- maturity_date: ISO date "YYYY-MM-DD" or null (if year only like 2026, use "2026-12-31")
-- coupon_rate: float or null (annual coupon rate e.g. 6.65, 9.60)
-- face_value: float or null (face value per unit if mentioned, or null)
-- currency: string ("INR" by default)
-- buyer: string (name of the party or counterparty buying)
-- seller: string (name of the party or counterparty selling)
-- quantity: float or null (numeric quantity or deal size, e.g. 10.0, 5.0, 1.58, 50.0)
-- quantity_unit: string (e.g. "Cr", "Crore", "Lakh", "Lacs", "Units")
-- is_indicative: integer 0 (definite agreed trade) or 1 (indicative quote / inquiry)
-- ytm: float or null (yield to maturity if negotiated, e.g. 6.465, 10.08)
-- final_price: float or null (final agreed price or yield rate)
-- settlement_reference: one of "T0", "T1", "T2" (default "T1" if unspecified or Monday value date)
-- settlement_date: ISO date "YYYY-MM-DD" or null
-- status: one of "CONCLUDED", "INCOMPLETE", "DISCARDED"
-  * "CONCLUDED": Both parties explicitly agreed (e.g. "done", "closed", "ok lets close", "confirmed")
-  * "INCOMPLETE": Trade negotiated or quoted but without final mutual agreement or confirmation
-  * "DISCARDED": Rejected, out of market, or small talk
-- is_deal_confirmed: boolean (true ONLY if both parties confirmed the trade)
+class DealExtraction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
-Strict rules:
-1. Ground every extracted field strictly in the conversation text. Do NOT hallucinate.
-2. Return ONLY the JSON object, with no preamble or commentary.
+    bond_identity_text: Optional[str] = None
+    isin_text: Optional[str] = None
+    issuer_text: Optional[str] = None
+    maturity_text: Optional[str] = None
+    coupon_rate: Optional[float] = None
+    credit_rating: Optional[str] = None
+    quantity_text: Optional[str] = None
+    ytm: Optional[str] = None
+    ytm_is_two_way: Optional[bool] = None
+    price: Optional[float] = None
+    settlement_text: Optional[str] = None
+    owner_side: Optional[Literal["BUY", "SELL", "UNKNOWN"]] = None
+    buyer_text: Optional[str] = None
+    seller_text: Optional[str] = None
+    rfq_id: Optional[str] = None
+    package_note: Optional[str] = None
+    is_indicative: Optional[bool] = None
+    status: Optional[
+        Literal[
+            "INITIATED",
+            "NEGOTIATING",
+            "CONCLUDED",
+            "CANCELLED",
+            "UNCERTAIN",
+            "DISCARDED",
+        ]
+    ] = None
+    status_evidence: Optional[str] = None
+    discard_reason: Optional[str] = None
+    evidence: Optional[Dict[str, List[str]]] = None
+
+
+class ExtractionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    deals: List[DealExtraction] = Field(default_factory=list)
+
+
+EXTRACTION_SYSTEM_PROMPT = """You extract bond-trade events from a WhatsApp conversation window.
+Return exactly one JSON object matching the supplied schema: {"deals": [...]}.
+One broadcast mentioning several bonds must produce one deal per bond. A shared
+yield or other shared term belongs in package_note, and must not be copied into
+each bond's fields unless the text supports doing so.
+
+Every schema field is nullable. Use null whenever the conversation does not
+state a value. Preserve text exactly as written for *_text fields. Do not
+convert maturity to a date, derive quantities, or infer any missing term.
+bond_identity_text requires bond-specific identity evidence; an issuer name
+alone is never a bond identity. Set price only for an explicitly stated clean
+price, never for a yield.
+
+For every non-null value, evidence maps its field name to one or more exact
+numbered conversation lines such as ["#2", "#4"]. Do not invent line numbers.
+
+Trading semantics (direction words are always relative to who spoke):
+- "bid" means buy; "offer" means sell.
+- "any bids?" means the sender is the seller; "any offer?", "need", and
+  "required" mean the sender is the buyer.
+- "holding bid at X" is a firm buy level; "can take" is a buy level.
+- owner_side describes BUY/SELL relative to the [OWN] participant, not the
+  speaker. Use UNKNOWN if direction cannot be established. buyer_text and
+  seller_text must be copied exactly as written when stated.
+
+Status rules:
+- INITIATED: an offer or inquiry has no response.
+- NEGOTIATING: counterparties exchanged counter-levels without acceptance.
+- CONCLUDED requires identifiable key terms and later acceptance from the
+  other side (for example, "ok lets close at 10.08" or "closed"). A bare "ok"
+  unrelated to the trade is not acceptance.
+- CANCELLED requires explicit pass or withdrawal replying to a specific offer.
+  No reply remains INITIATED.
+- UNCERTAIN when evidence is ambiguous or insufficient to classify otherwise.
+- DISCARDED for operations, payments, allocation, validation, "reported" or
+  "accepted" processing notices, and banter. Give a concise discard_reason.
+- When levels are revised, use the last stated level. Keep status_evidence
+  grounded in the numbered lines.
+
+Never infer a bond from an issuer name alone. Never invent values. Treat
+reported/accepted operational events as DISCARDED, not a trade conclusion.
+Return only the schema-conforming JSON, without prose or markdown fences.
 """
+
+
+def _extraction_prompt(context_snippet: str, previous_error: Optional[str] = None) -> str:
+    prompt = (
+        f"{EXTRACTION_SYSTEM_PROMPT}\n\n"
+        "Compact conversation glossary (intent hints only, not decisions):\n"
+        f"{format_lexicon_glossary()}\n\n"
+        "Synthetic examples (illustrative only):\n"
+        f"{json.dumps(EXTRACTION_EXAMPLES, ensure_ascii=False, indent=2)}\n\n"
+        f"Conversation Window:\n{context_snippet}"
+    )
+    if previous_error:
+        prompt += (
+            "\n\nYour previous response failed schema/JSON validation. "
+            "Correct the response using this error; do not repeat the failure:\n"
+            f"{previous_error}"
+        )
+    return prompt
 
 
 def get_model_context_length(model: str = MODEL_NAME) -> int:
@@ -1077,160 +1163,546 @@ def get_model_context_length(model: str = MODEL_NAME) -> int:
     return config.MODEL_CONTEXT_LENGTH_FALLBACK
 
 
-def call_llm_extraction(context_snippet: str, model: str = MODEL_NAME) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Calls langchain-ollama ChatOllama and extracts structured trade details.
-    Returns:
-    (extracted_json, token_usage_dict)
-    """
-    llm = ChatOllama(model=model, format="json", temperature=0.0)
-
-    prompt = (
-        f"{EXTRACTION_SYSTEM_PROMPT}\n\n"
-        f"Compact conversation glossary (intent hints only, not decisions):\n"
-        f"{format_lexicon_glossary()}\n\n"
-        f"Conversation Window:\n{context_snippet}"
+def call_llm_extraction(
+    context_snippet: str,
+    model: str = MODEL_NAME,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return structured deals, or an explicit extraction_failed result."""
+    llm = ChatOllama(
+        model=model,
+        format=ExtractionResult.model_json_schema(),
+        temperature=0.0,
     )
-
-    response = llm.invoke(prompt)
-
-    # Extract real token counts from usage_metadata and response_metadata
-    prompt_tokens = 0
-    completion_tokens = 0
-    total_tokens = 0
-
-    if hasattr(response, "usage_metadata") and response.usage_metadata:
-        prompt_tokens = response.usage_metadata.get("input_tokens", 0)
-        completion_tokens = response.usage_metadata.get("output_tokens", 0)
-        total_tokens = response.usage_metadata.get("total_tokens", prompt_tokens + completion_tokens)
-    elif hasattr(response, "response_metadata") and response.response_metadata:
-        meta = response.response_metadata
-        prompt_tokens = meta.get("prompt_eval_count", 0)
-        completion_tokens = meta.get("eval_count", 0)
-        total_tokens = prompt_tokens + completion_tokens
-
+    prompt = _extraction_prompt(context_snippet)
     token_metrics = {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "attempts": 0,
     }
+    last_raw_text = ""
+    last_error = ""
 
-    # Clean markdown fences if any
-    raw_content = response.content
-    cleaned_content = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_content.strip(), flags=re.MULTILINE).strip()
+    for attempt in range(config.LLM_RETRIES + 1):
+        token_metrics["attempts"] += 1
+        try:
+            response = llm.invoke(prompt)
+            usage = getattr(response, "usage_metadata", None) or {}
+            metadata = getattr(response, "response_metadata", None) or {}
+            prompt_tokens = usage.get(
+                "input_tokens",
+                metadata.get("prompt_eval_count", 0),
+            )
+            completion_tokens = usage.get(
+                "output_tokens",
+                metadata.get("eval_count", 0),
+            )
+            token_metrics["prompt_tokens"] += prompt_tokens
+            token_metrics["completion_tokens"] += completion_tokens
+            token_metrics["total_tokens"] += usage.get(
+                "total_tokens",
+                prompt_tokens + completion_tokens,
+            )
+            content = getattr(response, "content", response)
+            last_raw_text = (
+                content
+                if isinstance(content, str)
+                else json.dumps(content, ensure_ascii=False, default=str)
+            )
+            parsed = json.loads(last_raw_text)
+            validated = ExtractionResult.model_validate(parsed)
+            result = validated.model_dump(mode="json")
+            result["prompt_version"] = PROMPT_VERSION
+            return result, token_metrics
+        except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as error:
+            last_error = str(error)
+        except Exception as error:
+            last_error = str(error)
+            if not last_raw_text:
+                last_raw_text = str(error)
 
-    try:
-        extracted_data = json.loads(cleaned_content)
-    except Exception:
-        # Fallback regex search for JSON block
-        json_match = re.search(r"(\{.*\})", cleaned_content, re.DOTALL)
-        if json_match:
-            try:
-                extracted_data = json.loads(json_match.group(1))
-            except Exception:
-                extracted_data = {"status": "DISCARDED", "is_deal_confirmed": False, "raw_error": raw_content}
-        else:
-            extracted_data = {"status": "DISCARDED", "is_deal_confirmed": False, "raw_error": raw_content}
+        if attempt < config.LLM_RETRIES:
+            prompt = _extraction_prompt(context_snippet, last_error)
 
-    return extracted_data, token_metrics
+    return {
+        "extraction_failed": True,
+        "raw_text": last_raw_text,
+        "error": last_error,
+        "prompt_version": PROMPT_VERSION,
+    }, token_metrics
 
 
 # --------------------------------------------------------------------------
 # 5. BUSINESS RULE VALIDATION
 # --------------------------------------------------------------------------
 
-def validate_extraction(deal: Any) -> Dict[str, Any]:
-    """
-    Validates business rules for an extracted trade:
-    - ISIN format (12 alphanum chars)
-    - Identity type check
-    - Buyer != Seller
-    - Positive price & quantity
-    - Settlement reference check
-    - Status consistency
-    """
+_EVIDENCE_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+_NUMBER_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)?")
+_ACCEPTANCE_RE = re.compile(
+    r"\b(?:closed|close|confirmed|done|final|ho\s+gaya|done\s+hai)\b",
+    re.IGNORECASE,
+)
+_COUNTER_RE = re.compile(
+    r"\b(?:counter|revise|revised|instead|at\s+\d|@\s*\d|bid|offer)\b",
+    re.IGNORECASE,
+)
+
+
+def _evidence_normalize(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).translate(_EVIDENCE_DIGITS)
+    normalized = normalized.casefold()
+    normalized = re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _evidence_body(line: str) -> str:
+    return re.sub(
+        r"^\s*#\d+\s+\[\d{2}:\d{2}:\d{2}\]\s*",
+        "",
+        line,
+    )
+
+
+def _number_tokens(value: str) -> List[str]:
+    normalized = unicodedata.normalize("NFKC", value).translate(_EVIDENCE_DIGITS)
+    return [
+        token.replace(",", "").rstrip(".")
+        for token in _NUMBER_TOKEN_RE.findall(normalized)
+    ]
+
+
+def _same_number(left: str, right: str) -> bool:
+    try:
+        return Decimal(left) == Decimal(right)
+    except InvalidOperation:
+        return left == right
+
+
+def _numbered_lines(context_snippet: Optional[str]) -> Dict[str, str]:
+    if not context_snippet:
+        return {}
+    return {
+        match.group(1): match.group(0).strip()
+        for line in context_snippet.splitlines()
+        if (match := re.match(r"^\s*(#\d+)\s+\[[^\]]+\]\s+(.*)$", line))
+    }
+
+
+def _field_evidence_lines(
+    field: str,
+    value: Any,
+    evidence: Any,
+    numbered_lines: Dict[str, str],
+) -> List[str]:
+    if value is None or not isinstance(evidence, dict):
+        return []
+    citations = evidence.get(field)
+    if not isinstance(citations, list):
+        return []
+    return [
+        numbered_lines[citation]
+        for citation in citations
+        if isinstance(citation, str) and citation in numbered_lines
+    ]
+
+
+def _value_appears_in_lines(field: str, value: Any, lines: List[str]) -> bool:
+    if not lines or value is None:
+        return False
+    bodies = [_evidence_body(line) for line in lines]
+    if field == "isin_text":
+        return any(str(value) in line for line in bodies)
+    if field in {"ytm", "quantity_text", "coupon_rate", "price"}:
+        wanted_numbers = _number_tokens(str(value))
+        if not wanted_numbers:
+            return False
+        for line in bodies:
+            numeric_line = re.sub(r"\bT\s*\+\s*\d+\b", " ", line, flags=re.I)
+            numeric_line = re.sub(
+                r"\b[A-Z]{2}[A-Z0-9]{10}\b",
+                " ",
+                numeric_line,
+                flags=re.I,
+            )
+            line_numbers = _number_tokens(numeric_line)
+            if all(
+                any(_same_number(number, found) for found in line_numbers)
+                for number in wanted_numbers
+            ):
+                if field != "quantity_text":
+                    return True
+                quantity_words = re.findall(
+                    r"\b(?:crs?|crores?|lacs?|lakhs?|l|units?)\b",
+                    _evidence_normalize(str(value)),
+                )
+                line_text = _evidence_normalize(line)
+                if all(word in line_text.split() for word in quantity_words):
+                    return True
+        return False
+    if field == "owner_side":
+        for line in lines:
+            body = _evidence_body(line)
+            lower = body.casefold()
+            if re.search(r"\bany\s+bids?\b", lower):
+                speaker_side = "SELL"
+            elif re.search(r"\bany\s+offers?\b", lower):
+                speaker_side = "BUY"
+            elif re.search(r"\b(?:bid|bids|buy|buyer|can\s+take|holding\s+bid|need|required|lena\s+hai|chahiye)\b", lower):
+                speaker_side = "BUY"
+            elif re.search(r"\b(?:offer|offers|sell|seller|dena\s+hai)\b", lower):
+                speaker_side = "SELL"
+            else:
+                continue
+            owner_is_speaker = "[own]" in lower
+            owner_side = speaker_side if owner_is_speaker else (
+                "SELL" if speaker_side == "BUY" else "BUY"
+            )
+            if owner_side == value:
+                return True
+        return False
+    if field == "ytm_is_two_way":
+        has_two_way_quote = any(
+            re.search(r"\b\d{1,2}\.\d+\s*[-–]\s*\d+\b", line)
+            for line in bodies
+        )
+        return has_two_way_quote == value
+    if field == "is_indicative":
+        indicative = any(
+            re.search(r"\b(?:indicative|rfq|inquiry)\b", line, re.I)
+            for line in bodies
+        )
+        firm = any(
+            re.search(r"\b(?:firm|close|closed|confirmed|done)\b", line, re.I)
+            for line in bodies
+        )
+        if value:
+            return indicative
+        return firm
+    if field == "status":
+        if value == "CONCLUDED":
+            return any(_ACCEPTANCE_RE.search(line) for line in bodies)
+        if value == "CANCELLED":
+            return any(re.search(r"\b(?:pass|withdraw|cancel|not required)\b", line, re.I) for line in bodies)
+        if value == "NEGOTIATING":
+            return any(_COUNTER_RE.search(line) for line in bodies)
+        if value == "DISCARDED":
+            return any(re.search(r"\b(?:payment|allocation|validation|reported|accepted)\b", line, re.I) for line in bodies)
+        return bool(lines)
+    if field == "evidence":
+        return bool(lines)
+    normalized_value = _evidence_normalize(str(value))
+    return any(
+        normalized_value
+        and normalized_value in _evidence_normalize(line)
+        for line in bodies
+    )
+
+
+def _evidence_check(
+    deal: Dict[str, Any],
+    context_snippet: Optional[str],
+) -> Tuple[Dict[str, bool], List[str], Dict[str, List[str]]]:
+    evidence = deal.get("evidence") or {}
+    lines = _numbered_lines(context_snippet)
+    verified: Dict[str, bool] = {}
+    warnings: List[str] = []
+    cited_lines: Dict[str, List[str]] = {}
+
+    for field, value in list(deal.items()):
+        if field in {"evidence", "status_evidence"} or value is None:
+            continue
+        selected_lines = _field_evidence_lines(field, value, evidence, lines)
+        cited_lines[field] = selected_lines
+        is_verified = _value_appears_in_lines(field, value, selected_lines)
+        verified[field] = is_verified
+        if not is_verified:
+            deal[field] = None
+            warnings.append(f"unsupported_{field}")
+
+    status_evidence = deal.get("status_evidence")
+    if status_evidence is not None:
+        selected_lines = _field_evidence_lines(
+            "status_evidence",
+            status_evidence,
+            evidence,
+            lines,
+        )
+        cited_lines["status_evidence"] = selected_lines
+        verified["status_evidence"] = _value_appears_in_lines(
+            "status_evidence",
+            status_evidence,
+            selected_lines,
+        )
+        if not verified["status_evidence"]:
+            deal["status_evidence"] = None
+            warnings.append("unsupported_status_evidence")
+
+    return verified, warnings, cited_lines
+
+
+def _settlement_reference_datetime(
+    context_snippet: Optional[str],
+    settlement_citations: List[str],
+    fallback: Optional[datetime],
+) -> Optional[datetime]:
+    date_match = re.search(r"^Date:\s*(\d{4}-\d{2}-\d{2})\s*$", context_snippet or "", re.M)
+    if date_match:
+        for line in (context_snippet or "").splitlines():
+            for citation in settlement_citations:
+                time_match = re.match(
+                    rf"^{re.escape(citation)}\s+\[(\d{{2}}:\d{{2}}:\d{{2}})\]",
+                    line,
+                )
+                if not time_match:
+                    continue
+                try:
+                    return datetime.fromisoformat(
+                        f"{date_match.group(1)}T{time_match.group(1)}"
+                    )
+                except ValueError:
+                    return fallback
+    return fallback
+
+
+def _normalize_extracted_fields(
+    deal: Dict[str, Any],
+    context_snippet: Optional[str],
+    message_datetime: Optional[datetime],
+    cited_lines: Dict[str, List[str]],
+) -> Tuple[List[str], bool]:
+    warnings = []
+    needs_review = False
+
+    quantity_text = deal.get("quantity_text")
+    quantity_input = quantity_text
+    if quantity_text is not None and normalize_quantity(quantity_text) is None:
+        quantity_lines = cited_lines.get("quantity_text", [])
+        isin_match = next(
+            (
+                match.group(0)
+                for line in quantity_lines
+                if (match := re.search(r"\b[A-Z]{2}[A-Z0-9]{10}\b", line, re.I))
+            ),
+            None,
+        )
+        if isin_match:
+            quantity_input = f"{quantity_text} {isin_match}"
+    deal["normalized_quantity"] = (
+        normalize_quantity(quantity_input)
+        if quantity_text is not None
+        else None
+    )
+    if quantity_text is not None and deal["normalized_quantity"] is None:
+        warnings.append("invalid_quantity_text")
+        needs_review = True
+
+    maturity_text = deal.get("maturity_text")
+    maturity = (
+        normalize_maturity(maturity_text)
+        if maturity_text is not None
+        else {"maturity_text": None, "maturity_date": None, "maturity_ym": None}
+    )
+    deal["maturity_date"] = maturity["maturity_date"]
+    deal["maturity_ym"] = maturity["maturity_ym"]
+    if maturity_text is not None and maturity["maturity_date"] is None and maturity["maturity_ym"] is None:
+        warnings.append("unparsed_maturity_text")
+        needs_review = True
+
+    ytm_text = deal.get("ytm")
+    yield_result = (
+        normalize_yield_coupon(f"YTM {ytm_text}")
+        if ytm_text is not None
+        else {"yields": [], "two_way_quotes": [], "warnings": []}
+    )
+    deal["ytm_values"] = yield_result["yields"]
+    if yield_result["two_way_quotes"]:
+        deal["ytm_is_two_way"] = True
+    warnings.extend("yield_out_of_expected_range" for _ in yield_result["warnings"])
+    if yield_result["warnings"]:
+        needs_review = True
+
+    settlement_text = deal.get("settlement_text")
+    settlement_citations = (
+        deal.get("evidence", {}).get("settlement_text", [])
+        if isinstance(deal.get("evidence"), dict)
+        else []
+    )
+    settlement_datetime = _settlement_reference_datetime(
+        context_snippet,
+        settlement_citations if isinstance(settlement_citations, list) else [],
+        message_datetime,
+    )
+    settlement = None
+    if settlement_text is not None:
+        if settlement_datetime is None:
+            settlement = {
+                "settlement_date": None,
+                "label": "OTHER",
+                "needs_review": True,
+            }
+        else:
+            settlement = resolve_settlement(
+                settlement_text,
+                settlement_datetime,
+                market_holidays=config.MARKET_HOLIDAYS,
+            )
+        needs_review = needs_review or settlement["needs_review"]
+    deal["settlement_date"] = settlement["settlement_date"] if settlement else None
+    deal["settlement_label"] = settlement["label"] if settlement else None
+    deal["settlement_needs_review"] = (
+        settlement["needs_review"] if settlement else False
+    )
+    if deal["settlement_needs_review"]:
+        warnings.append("settlement_needs_review")
+
+    return warnings, needs_review
+
+
+def _conclusion_check(
+    deal: Dict[str, Any],
+    verified: Dict[str, bool],
+    cited_lines: Dict[str, List[str]],
+) -> List[str]:
+    missing = []
+    identity_verified = any(
+        deal.get(field) is not None and verified.get(field, False)
+        for field in ("bond_identity_text", "isin_text")
+    )
+    if not identity_verified:
+        missing.append("bond_identity_text_or_isin_text")
+    if deal.get("ytm") is None or not verified.get("ytm", False):
+        missing.append("ytm")
+    if deal.get("quantity_text") is None or not verified.get("quantity_text", False):
+        missing.append("quantity_text")
+    side_present = any(
+        deal.get(field) is not None and verified.get(field, False)
+        for field in ("owner_side", "buyer_text", "seller_text")
+    )
+    if not side_present:
+        missing.append("owner_side_or_buyer_text_or_seller_text")
+
+    term_fields = [
+        "bond_identity_text",
+        "isin_text",
+        "issuer_text",
+        "maturity_text",
+        "coupon_rate",
+        "credit_rating",
+        "ytm",
+        "price",
+        "quantity_text",
+        "settlement_text",
+        "rfq_id",
+    ]
+    term_fields.extend(
+        ["owner_side"]
+        if deal.get("owner_side") is not None
+        else ["buyer_text", "seller_text"]
+    )
+    term_line_numbers = [
+        int(match.group(1))
+        for field in term_fields
+        if deal.get(field) is not None and verified.get(field, False)
+        for line in cited_lines.get(field, [])
+        if (match := re.match(r"#(\d+)", line)) is not None
+    ]
+    acceptance_lines = cited_lines.get("status_evidence", [])
+    acceptance_numbered = [
+        (int(match.group(1)), line)
+        for line in acceptance_lines
+        if (match := re.match(r"#(\d+)", line)) is not None
+    ]
+    has_later_acceptance = any(
+        number > max(term_line_numbers, default=0) and _ACCEPTANCE_RE.search(line)
+        for number, line in acceptance_numbered
+    )
+    if not has_later_acceptance:
+        missing.append("later_acceptance_evidence")
+
+    return missing
+
+
+def validate_extraction(
+    deal: Any,
+    context_snippet: Optional[str] = None,
+    message_datetime: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Validate, normalize, and evidence-check a single extracted deal."""
     if not isinstance(deal, dict):
         return {
-            "status": "DISCARDED",
-            "is_valid": False,
-            "validation_errors": ["Invalid extraction output format"],
-            "validation_warnings": [],
+            "extraction_failed": True,
+            "raw_text": json.dumps(deal, ensure_ascii=False, default=str),
+            "error": "Extraction output must be a deal object",
+            "prompt_version": PROMPT_VERSION,
+        }
+    try:
+        validated = DealExtraction.model_validate(deal).model_dump(mode="json")
+    except ValidationError as error:
+        return {
+            "extraction_failed": True,
+            "raw_text": json.dumps(deal, ensure_ascii=False, default=str),
+            "error": str(error),
+            "prompt_version": PROMPT_VERSION,
         }
 
     errors: List[str] = []
     warnings: List[str] = []
+    verified, evidence_warnings, cited_lines = _evidence_check(
+        validated,
+        context_snippet,
+    )
+    warnings.extend(evidence_warnings)
+    normalization_warnings, normalizer_needs_review = _normalize_extracted_fields(
+        validated,
+        context_snippet,
+        message_datetime,
+        cited_lines,
+    )
+    warnings.extend(normalization_warnings)
 
-    # 1. Status & Confirmation
-    is_confirmed = deal.get("is_deal_confirmed", False)
-    status = deal.get("status", "INCOMPLETE")
-    if not is_confirmed and status == "CONCLUDED":
-        deal["status"] = "INCOMPLETE"
-        warnings.append("Mutual confirmation not found in text; status marked INCOMPLETE")
+    missing_fields = _conclusion_check(validated, verified, cited_lines)
+    if (
+        validated.get("buyer_text")
+        and validated.get("seller_text")
+        and validated["buyer_text"].casefold() == validated["seller_text"].casefold()
+    ):
+        errors.append("buyer_equals_seller")
+    original_status = validated.get("status")
+    if original_status == "CONCLUDED" and missing_fields:
+        validated["status"] = (
+            "NEGOTIATING"
+            if any(_COUNTER_RE.search(line) for line in (context_snippet or "").splitlines())
+            else "UNCERTAIN"
+        )
+        warnings.append("conclusion_downgraded")
 
-    # 2. Bond Identity
-    bond_identity = deal.get("bond_identity")
-    if not bond_identity or bond_identity == "UNKNOWN":
-        errors.append("Bond identity missing or unknown")
-
-    # 3. ISIN Format
-    isin = deal.get("isin")
-    if isin:
-        isin = isin.strip().upper()
-        deal["isin"] = isin
-        if not re.match(r"^[A-Z]{2}[A-Z0-9]{9}\d$", isin):
-            warnings.append(f"ISIN '{isin}' does not strictly match 12-char international format")
-
-    # 4. Identity Type CHECK constraint
-    id_type = deal.get("identity_type", "UNKNOWN")
-    if id_type not in ('ISIN', 'CUSIP', 'SERIES', 'NAME_ONLY', 'UNKNOWN'):
-        deal["identity_type"] = "ISIN" if isin else "NAME_ONLY"
-
-    # 5. Buyer & Seller
-    buyer = deal.get("buyer")
-    seller = deal.get("seller")
-
-    if deal.get("status") == "CONCLUDED":
-        if not buyer or buyer in ("UNKNOWN", "None", ""):
-            errors.append("Missing buyer in concluded trade")
-        if not seller or seller in ("UNKNOWN", "None", ""):
-            errors.append("Missing seller in concluded trade")
-        if buyer and seller and buyer.lower() == seller.lower():
-            errors.append("Buyer and seller cannot be the same entity")
-
-    # 6. Price & Quantity
-    price = deal.get("final_price") or deal.get("price") or deal.get("ytm")
-    if price is not None:
-        try:
-            deal["final_price"] = float(price)
-            if deal["final_price"] <= 0:
-                errors.append("Price/Yield must be positive")
-        except (ValueError, TypeError):
-            errors.append("Price must be a valid number")
-    elif deal.get("status") == "CONCLUDED":
-        errors.append("Missing agreed price/yield in concluded trade")
-
-    qty = deal.get("quantity")
-    if qty is not None:
-        try:
-            deal["quantity"] = float(qty)
-            if deal["quantity"] <= 0:
-                errors.append("Quantity must be positive")
-        except (ValueError, TypeError):
-            errors.append("Quantity must be a valid number")
-
-    # 7. Settlement Reference CHECK constraint
-    settlement_ref = deal.get("settlement_reference") or "T1"
-    if settlement_ref not in ('T0', 'T1', 'T2'):
-        deal["settlement_reference"] = "T1"
-
-    # 8. Status CHECK constraint
-    final_status = deal.get("status", "INCOMPLETE")
-    if final_status not in ('INCOMPLETE', 'CONCLUDED', 'DISCARDED'):
-        deal["status"] = "INCOMPLETE"
-
-    is_valid = len(errors) == 0
-    deal["is_valid"] = is_valid
-    deal["validation_errors"] = errors
-    deal["validation_warnings"] = warnings
-
-    return deal
+    key_checks = {
+        "bond_identity": any(
+            validated.get(field) is not None and verified.get(field, False)
+            for field in ("bond_identity_text", "isin_text")
+        ),
+        "ytm": validated.get("ytm") is not None and verified.get("ytm", False),
+        "quantity": (
+            validated.get("quantity_text") is not None
+            and verified.get("quantity_text", False)
+        ),
+        "side": any(
+            validated.get(field) is not None and verified.get(field, False)
+            for field in ("owner_side", "buyer_text", "seller_text")
+        ),
+    }
+    if original_status == "CONCLUDED":
+        key_checks["acceptance"] = (
+            "later_acceptance_evidence" not in missing_fields
+        )
+    confidence = sum(key_checks.values()) / len(key_checks)
+    validated["errors"] = errors
+    validated["warnings"] = warnings
+    validated["missing_fields"] = missing_fields
+    validated["confidence"] = confidence
+    validated["needs_review"] = (
+        confidence < config.REVIEW_CONFIDENCE_THRESHOLD
+        or normalizer_needs_review
+        or validated.get("settlement_needs_review", False)
+    )
+    return validated

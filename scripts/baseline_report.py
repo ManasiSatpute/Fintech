@@ -102,7 +102,10 @@ def _select_contexts(contexts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _mock_extraction(_: str) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    return {}, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    return {
+        "deals": [],
+        "prompt_version": pipeline.PROMPT_VERSION,
+    }, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
 
 def _llm_mode() -> Tuple[bool, Optional[str]]:
@@ -141,12 +144,27 @@ def create_report(input_path: Path) -> Dict[str, Any]:
     non_object_outputs = []
     for context in selected_contexts:
         result, tokens = extract(context["snippet_text"])
-        deals = result if isinstance(result, list) else [result]
+        if result.get("extraction_failed"):
+            non_object_outputs.append(result)
+            continue
+        deals = result.get("deals", [])
         for raw_deal in deals:
             if not isinstance(raw_deal, dict):
                 non_object_outputs.append(raw_deal)
                 continue
-            validated_deal = pipeline.validate_extraction(copy.deepcopy(raw_deal))
+            context_datetime = max(
+                (
+                    message["dt"]
+                    for message in context["messages"]
+                    if isinstance(message.get("dt"), datetime)
+                ),
+                default=None,
+            )
+            validated_deal = pipeline.validate_extraction(
+                copy.deepcopy(raw_deal),
+                context_snippet=context["snippet_text"],
+                message_datetime=context_datetime,
+            )
             extracted_deals.append({
                 "context_id": context["context_id"],
                 "group_name": context.get("group_name"),
@@ -159,6 +177,7 @@ def create_report(input_path: Path) -> Dict[str, Any]:
         "source_file": str(input_path.resolve()),
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "model_name": pipeline.MODEL_NAME,
+        "prompt_version": pipeline.PROMPT_VERSION,
         "llm_mode": "mock" if use_mock else "ollama",
         "llm_fallback_reason": fallback_reason,
         "messages_parsed": len(messages),

@@ -473,39 +473,60 @@
 
           extractData.extractions.forEach(d => {
 
-            const status = d.status || 'INCOMPLETE';
+            const status = d.extraction_failed
+              ? 'EXTRACTION FAILED'
+              : (d.status || 'UNCERTAIN');
 
             let badgeClass = 'badge-incomplete';
 
             if (status === 'CONCLUDED') {
               badgeClass = 'badge-concluded';
-            } else if (status === 'DISCARDED') {
+            } else if (status === 'DISCARDED' || status === 'CANCELLED') {
               badgeClass = 'badge-discarded';
             }
 
             const bond =
-              d.bond_identity || 'Bond Unspecified';
+              d.bond_identity_text || 'Bond Unspecified';
 
-            const isin = d.isin
-              ? ` (ISIN: ${d.isin})`
+            const isin = d.isin_text
+              ? ` (ISIN: ${d.isin_text})`
               : '';
 
-            const qty = d.quantity
-              ? `${d.quantity} ${d.quantity_unit || 'Cr'}`
-              : '—';
+            const qty = d.quantity_text || '—';
 
             const price =
-              d.final_price !== null &&
-              d.final_price !== undefined
-                ? `${d.final_price}`
+              d.price !== null &&
+              d.price !== undefined
+                ? `${d.price}`
                 : '—';
 
             const ytm = d.ytm
-              ? `${d.ytm}%`
+              ? `${d.ytm}${d.ytm_is_two_way ? ' (two-way)' : '%' }`
               : '—';
 
-            const settlement =
-              d.settlement_reference || 'T1';
+            const settlement = d.settlement_text || '—';
+
+            if (d.extraction_failed) {
+              dealsHtml += `
+                <div class="deal-card">
+                  <div class="deal-card-header">
+                    <div class="deal-title">Extraction failed</div>
+                    <span class="badge ${badgeClass}">${status}</span>
+                  </div>
+                  <div class="deal-grid">
+                    <div class="spec-item">
+                      <span class="spec-label">Error</span>
+                      <span class="spec-value">${escapeHtml(d.error || 'Unable to parse model output')}</span>
+                    </div>
+                    <div class="spec-item">
+                      <span class="spec-label">Raw model output</span>
+                      <span class="spec-value">${escapeHtml(d.raw_text || '')}</span>
+                    </div>
+                  </div>
+                </div>
+              `;
+              return;
+            }
 
             dealsHtml += `
               <div class="deal-card">
@@ -531,7 +552,7 @@
                     </span>
 
                     <span class="spec-value">
-                      ${escapeHtml(d.buyer || '—')}
+                      ${escapeHtml(d.buyer_text || '—')}
                     </span>
                   </div>
 
@@ -541,7 +562,7 @@
                     </span>
 
                     <span class="spec-value">
-                      ${escapeHtml(d.seller || '—')}
+                      ${escapeHtml(d.seller_text || '—')}
                     </span>
                   </div>
 
