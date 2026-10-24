@@ -1,9 +1,9 @@
 [11/08/26, 11:00:00 AM] Chat: ‎Messages and calls are end-to-end encrypted.
-[11/08/26, 11:00:10 AM] Vikram: Do you have 4Cr 7.50 GS 2030?
-[11/08/26, 11:00:15 AM] Sonia: Yes, selling at 7.55
-[11/08/26, 11:00:20 AM] Vikram: Can you do 7.52?
-[11/08/26, 11:00:25 AM] Sonia: 7.53 is best
-[11/08/26, 11:00:30 AM] Vikram: Let me check with my client
-[11/08/26, 11:05:00 AM] Vikram: Client is ok with 7.53
-[11/08/26, 11:05:10 AM] Sonia: Great, I'll send the contract
-[11/08/26, 11:05:15 AM] Vikram: Ok
+[11/08/26, 11:00:10 AM] Person 35: Do you have 4Cr 7.50 GS 2030?
+[11/08/26, 11:00:15 AM] Person 30: Yes, selling at 7.55
+[11/08/26, 11:00:20 AM] Person 35: Can you do 7.52?
+[11/08/26, 11:00:25 AM] Person 30: 7.53 is best
+[11/08/26, 11:00:30 AM] Person 35: Let me check with my client
+[11/08/26, 11:05:00 AM] Person 35: Client is ok with 7.53
+[11/08/26, 11:05:10 AM] Person 30: Great, I'll send the contract
+[11/08/26, 11:05:15 AM] Person 35: Ok

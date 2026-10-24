@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+import config
 import db
 import pipeline
 
@@ -24,7 +25,7 @@ app = FastAPI(title="Bond Trade Extraction App", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=config.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -58,13 +59,18 @@ async def upload_file(file: UploadFile = File(...)):
     upload_id = str(uuid.uuid4())
     filename = file.filename or "chat_export.txt"
 
-    parsed_messages = pipeline.parse_raw_chat_content(raw_text, chat_id=upload_id)
+    parsed_messages, parse_report = pipeline.parse_raw_chat_content(
+        raw_text,
+        chat_id=upload_id,
+        return_report=True,
+    )
 
     UPLOAD_SESSIONS[upload_id] = {
         "upload_id": upload_id,
         "filename": filename,
         "raw_text": raw_text,
         "parsed_messages": parsed_messages,
+        "parse_report": parse_report,
         "extractions": [],
         "token_usage": {},
         "context_window": {},
@@ -74,6 +80,7 @@ async def upload_file(file: UploadFile = File(...)):
         "upload_id": upload_id,
         "filename": filename,
         "parsed_count": len(parsed_messages),
+        "parse_report": parse_report,
         "messages": [
             {
                 "message_id": m["message_id"],
@@ -107,16 +114,24 @@ async def extract_trades(upload_id: str):
             "trade_contexts_count": 0,
             "extractions": [],
             "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            "context_window": {"used_tokens": 0, "max_tokens": 262144, "percentage": 0.0},
+            "context_window": {
+                "used_tokens": 0,
+                "max_tokens": config.MODEL_CONTEXT_LENGTH_FALLBACK,
+                "percentage": 0.0,
+            },
         }
 
     # 4. Clean + route + group into trade contexts
-    contexts = pipeline.group_into_trade_contexts(parsed_messages)
+    contexts, skipped_low_relevance = pipeline.group_into_trade_contexts(
+        parsed_messages,
+        return_skipped=True,
+    )
 
     if not contexts:
         return {
             "upload_id": upload_id,
             "trade_contexts_count": 0,
+            "skipped_low_relevance": len(skipped_low_relevance),
             "message": "No bond-relevant trade negotiation contexts detected in chat.",
             "extractions": [],
             "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -133,18 +148,11 @@ async def extract_trades(upload_id: str):
     total_completion_tokens = 0
     max_single_call_tokens = 0
 
-    # Limit to top relevant contexts if too many to avoid long delays, or process all
-    # For large multi-channel chats like 207 msgs, limit to 6 most relevant contexts with multiple messages or ISIN
-    sorted_contexts = sorted(
-        contexts,
-        key=lambda c: (
-            bool("INE" in c["snippet_text"]),
-            len(c["messages"]) > 1,
-            len(c["messages"])
-        ),
-        reverse=True
+    selected_contexts = (
+        contexts
+        if config.MAX_CONTEXTS is None
+        else contexts[:config.MAX_CONTEXTS]
     )
-    selected_contexts = sorted_contexts[:8] if len(sorted_contexts) > 8 else sorted_contexts
 
     for ctx in selected_contexts:
         deal_or_deals, tokens = pipeline.call_llm_extraction(ctx["snippet_text"])
@@ -203,6 +211,7 @@ async def extract_trades(upload_id: str):
         "upload_id": upload_id,
         "trade_contexts_count": len(selected_contexts),
         "total_contexts_detected": len(contexts),
+        "skipped_low_relevance": len(skipped_low_relevance),
         "extractions": extractions,
         "token_usage": token_usage,
         "context_window": context_window,
@@ -299,13 +308,18 @@ def load_sample_file(filename: str):
         raw_text = f.read()
 
     upload_id = str(uuid.uuid4())
-    parsed_messages = pipeline.parse_raw_chat_content(raw_text, chat_id=upload_id)
+    parsed_messages, parse_report = pipeline.parse_raw_chat_content(
+        raw_text,
+        chat_id=upload_id,
+        return_report=True,
+    )
 
     UPLOAD_SESSIONS[upload_id] = {
         "upload_id": upload_id,
         "filename": safe_name,
         "raw_text": raw_text,
         "parsed_messages": parsed_messages,
+        "parse_report": parse_report,
         "extractions": [],
         "token_usage": {},
         "context_window": {},
@@ -315,6 +329,7 @@ def load_sample_file(filename: str):
         "upload_id": upload_id,
         "filename": safe_name,
         "parsed_count": len(parsed_messages),
+        "parse_report": parse_report,
         "messages": [
             {
                 "message_id": m["message_id"],
