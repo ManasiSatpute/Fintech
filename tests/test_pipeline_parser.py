@@ -344,6 +344,52 @@ class JsonlParserTests(unittest.TestCase):
         self.assertNotIn("[MEDIA message]", contexts[0]["snippet_text"])
         self.assertIn("done", contexts[0]["snippet_text"])
 
+    def test_context_snippet_numbers_messages_and_masks_contact_details(self):
+        messages = [
+            {
+                "message_id": "message-1",
+                "chat_name": "Desk Channel",
+                "chat_type": "GROUP",
+                "sender": "Alice",
+                "sender_number": "120012345678901:2",
+                "receiver_number": "919876543210",
+                "is_own": True,
+                "is_media": False,
+                "message_text": "First line\nSecond line 9876543210",
+                "replying_to": "",
+                "dt": datetime(2026, 7, 13, 10, 0),
+            },
+            {
+                "message_id": "message-2",
+                "chat_name": "Desk Channel",
+                "chat_type": "GROUP",
+                "sender": "Bob",
+                "sender_number": "120012345678901:2",
+                "receiver_number": "919876543210",
+                "is_own": False,
+                "is_media": True,
+                "message_text": "",
+                "replying_to": "q" * 205,
+                "dt": datetime(2026, 7, 13, 10, 1),
+            },
+        ]
+
+        snippet, number_map = pipeline.format_context_snippet(messages, "Fallback")
+
+        self.assertEqual(
+            number_map,
+            {"#1": "message-1", "#2": "message-2"},
+        )
+        self.assertTrue(snippet.startswith(
+            "Chat: Desk Channel\nType: GROUP\nDate: 2026-07-13"
+        ))
+        self.assertIn("#1 [10:00:00] [OWN] Alice: First line", snippet)
+        self.assertIn("    Second line [phone]", snippet)
+        self.assertIn("#2 [10:01:00] Bob: [attachment]", snippet)
+        self.assertIn(f"    replying to: {'q' * 200}", snippet)
+        self.assertNotIn("120012345678901", snippet)
+        self.assertNotIn("919876543210", snippet)
+
     def test_preserves_fields_and_builds_stable_chat_identity(self):
         rows = [
             {

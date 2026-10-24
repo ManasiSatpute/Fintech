@@ -36,6 +36,86 @@ if not isinstance(ISSUER_ALIASES, dict) or any(
 ):
     raise ValueError(f"Invalid issuer alias configuration: {ISSUER_ALIASES_PATH}")
 
+LEXICON_PATH = Path(__file__).with_name("lexicon.json")
+
+
+def load_lexicon(path: Path = LEXICON_PATH) -> Dict[str, List[str]]:
+    # A fluent Marathi/Hindi speaker should review the Roman-script entries.
+    with path.open(encoding="utf-8") as lexicon_file:
+        lexicon = json.load(lexicon_file)
+    if not isinstance(lexicon, dict) or any(
+        not isinstance(category, str)
+        or not isinstance(entries, list)
+        or not all(isinstance(entry, str) and entry.strip() for entry in entries)
+        for category, entries in lexicon.items()
+    ):
+        raise ValueError(f"Invalid lexicon configuration: {path}")
+    if "needs_context" not in lexicon:
+        raise ValueError(f"Lexicon must define needs_context: {path}")
+    return lexicon
+
+
+LEXICON = load_lexicon()
+
+
+def _normalize_lexicon_text(value: Any) -> str:
+    text = _clean_message_text(value).translate(
+        str.maketrans("०१२३४५६७८९", "0123456789")
+    ).casefold()
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def match_lexicon(message: Any) -> Dict[str, Any]:
+    """Return lexical intent hints only; matches are not extraction decisions."""
+    raw_text = (
+        message.get("message_text", "")
+        if isinstance(message, dict)
+        else message
+    )
+    normalized_text = _normalize_lexicon_text(raw_text)
+    ambiguous_entries = {
+        _normalize_lexicon_text(entry)
+        for entry in LEXICON.get("needs_context", [])
+    }
+    matches: Dict[str, List[str]] = {}
+    for category, entries in LEXICON.items():
+        found = []
+        for entry in entries:
+            normalized_entry = _normalize_lexicon_text(entry)
+            if category != "needs_context" and normalized_entry in ambiguous_entries:
+                continue
+            if re.search(
+                rf"(?<!\w){re.escape(normalized_entry)}(?!\w)",
+                normalized_text,
+                flags=re.UNICODE,
+            ):
+                found.append(entry)
+        if found:
+            matches[category] = found
+    return {
+        "matches": matches,
+        "needs_context": matches.get("needs_context", []),
+        "has_intent_hints": any(
+            category != "needs_context" for category in matches
+        ),
+    }
+
+
+def format_lexicon_glossary() -> str:
+    """Build a compact glossary for the extraction prompt."""
+    sections = []
+    for category, entries in LEXICON.items():
+        if category == "needs_context":
+            continue
+        sections.append(f"{category}: {', '.join(entries)}")
+    sections.append(
+        "needs_context (ambiguous; interpret only with surrounding messages): "
+        + ", ".join(LEXICON["needs_context"])
+    )
+    return " | ".join(sections)
+
 # --------------------------------------------------------------------------
 # 1. PARSING RAW CHAT EXPORTS (TXT & JSON)
 # --------------------------------------------------------------------------
@@ -840,6 +920,10 @@ def group_into_trade_contexts(
         burst_messages = assigned["messages"]
         group_name = assigned["chat_name"]
         relevance_score = get_window_relevance_score(burst_messages)
+        snippet_text, message_number_map = format_context_snippet(
+            burst_messages,
+            group_name,
+        )
         context = {
             "context_id": str(uuid.uuid4()),
             "chat_key": assigned["chat_key"],
@@ -853,7 +937,8 @@ def group_into_trade_contexts(
             "group_name": group_name,
             "messages": burst_messages,
             "message_indices": assigned["message_indices"],
-            "snippet_text": format_context_snippet(burst_messages, group_name),
+            "snippet_text": snippet_text,
+            "message_number_map": message_number_map,
             "relevance_score": relevance_score,
         }
         if relevance_score >= config.RELEVANCE_THRESHOLD:
@@ -866,15 +951,68 @@ def group_into_trade_contexts(
     return contexts
 
 
-def format_context_snippet(window: List[Dict[str, Any]], group_name: str) -> str:
-    lines = []
-    if group_name and group_name != "Default":
-        lines.append(f"Channel: {group_name}")
-    for m in window:
-        time_str = m["dt"].strftime("%H:%M:%S")
-        text = "[attachment]" if m.get("is_media", False) else m["message_text"]
-        lines.append(f"[{time_str}] {m['sender']}: {text}")
-    return "\n".join(lines)
+_PHONE_NUMBER_RE = re.compile(
+    r"(?<![A-Z0-9])\+?\d(?:[\d ()-]{6,}\d)(?![A-Z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _context_safe_text(value: Any, private_numbers: List[str]) -> str:
+    text = _clean_message_text(value)
+    for number in private_numbers:
+        if number:
+            text = re.sub(re.escape(number), "[phone]", text, flags=re.IGNORECASE)
+    return _PHONE_NUMBER_RE.sub("[phone]", text)
+
+
+def format_context_snippet(
+    window: List[Dict[str, Any]],
+    group_name: str,
+) -> Tuple[str, Dict[str, Any]]:
+    if not window:
+        return "", {}
+
+    first_message = window[0]
+    chat_name = first_message.get("chat_name") or group_name or "Default"
+    chat_type = first_message.get("chat_type") or "UNKNOWN"
+    date_text = first_message["dt"].strftime("%Y-%m-%d")
+    lines = [
+        f"Chat: {chat_name}",
+        f"Type: {chat_type}",
+        f"Date: {date_text}",
+    ]
+    message_number_map = {}
+    private_numbers = [
+        str(message.get("sender_number", ""))
+        for message in window
+        if message.get("sender_number")
+    ]
+    private_numbers.extend(
+        str(message.get("receiver_number", ""))
+        for message in window
+        if message.get("receiver_number")
+    )
+
+    for number, message in enumerate(window, start=1):
+        message_number_map[f"#{number}"] = message.get("message_id")
+        time_text = message["dt"].strftime("%H:%M:%S")
+        sender = _context_safe_text(message.get("sender", ""), private_numbers)
+        if message.get("is_own", False):
+            sender = f"[OWN] {sender}"
+        if message.get("is_media", False):
+            body_lines = ["[attachment]"]
+        else:
+            body = _context_safe_text(message.get("message_text", ""), private_numbers)
+            body_lines = body.splitlines() or [""]
+        lines.append(f"#{number} [{time_text}] {sender}: {body_lines[0]}")
+        lines.extend(f"    {body_line}" for body_line in body_lines[1:])
+
+        reply = _context_safe_text(message.get("replying_to", ""), private_numbers)
+        if reply:
+            quoted = reply[:200]
+            lines.append(f"    replying to: {quoted}")
+
+    return "\n".join(lines), message_number_map
 
 
 # --------------------------------------------------------------------------
@@ -947,7 +1085,12 @@ def call_llm_extraction(context_snippet: str, model: str = MODEL_NAME) -> Tuple[
     """
     llm = ChatOllama(model=model, format="json", temperature=0.0)
 
-    prompt = f"{EXTRACTION_SYSTEM_PROMPT}\n\nConversation Window:\n{context_snippet}"
+    prompt = (
+        f"{EXTRACTION_SYSTEM_PROMPT}\n\n"
+        f"Compact conversation glossary (intent hints only, not decisions):\n"
+        f"{format_lexicon_glossary()}\n\n"
+        f"Conversation Window:\n{context_snippet}"
+    )
 
     response = llm.invoke(prompt)
 
