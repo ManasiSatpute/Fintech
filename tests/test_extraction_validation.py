@@ -141,6 +141,132 @@ class EvidenceValidationTests(unittest.TestCase):
         self.assertTrue(result["needs_review"])
         self.assertIn("settlement_needs_review", result["warnings"])
 
+    def test_ytm_normalised_to_plain_number_without_percent_sign(self):
+        deal = concluded_deal()
+        deal["ytm"] = "10.08%"
+        result = pipeline.validate_extraction(deal, SNIPPET)
+        self.assertEqual(result["ytm"], 10.08)
+        self.assertIsInstance(result["ytm"], float)
+        self.assertEqual(result["ytm_values"], [10.08])
+        self.assertNotIn("yield_out_of_expected_range", result["warnings"])
+
+    def test_yield_outside_range_high_is_null_with_warning_and_needs_review(self):
+        snippet = (
+            "Chat: Synthetic Desk\n"
+            "Type: GROUP\n"
+            "Date: 2026-10-20\n"
+            "#1 [10:00:00] [OWN] Desk: Offering Synthetic GS Aug 2030 at 27.50% for 5 cr\n"
+            "#2 [10:02:00] Trader B: closed\n"
+        )
+        deal = concluded_deal()
+        deal["ytm"] = "27.50%"
+        result = pipeline.validate_extraction(deal, snippet)
+        self.assertIsNone(result["ytm"])
+        self.assertIn("yield_out_of_expected_range", result["warnings"])
+        self.assertTrue(result["needs_review"])
+        self.assertIn("ytm", result["missing_fields"])
+
+    def test_yield_outside_range_low_is_null_with_warning_and_needs_review(self):
+        snippet = (
+            "Chat: Synthetic Desk\n"
+            "Type: GROUP\n"
+            "Date: 2026-10-20\n"
+            "#1 [10:00:00] [OWN] Desk: Offering Synthetic GS Aug 2030 at 2.50% for 5 cr\n"
+            "#2 [10:02:00] Trader B: closed\n"
+        )
+        deal = concluded_deal()
+        deal["ytm"] = "2.50%"
+        result = pipeline.validate_extraction(deal, snippet)
+        self.assertIsNone(result["ytm"])
+        self.assertIn("yield_out_of_expected_range", result["warnings"])
+        self.assertTrue(result["needs_review"])
+        self.assertIn("ytm", result["missing_fields"])
+
+    def test_yield_boundary_values_are_valid(self):
+        snippet_3 = (
+            "Chat: Synthetic Desk\n"
+            "Type: GROUP\n"
+            "Date: 2026-10-20\n"
+            "#1 [10:00:00] [OWN] Desk: Offering Synthetic GS Aug 2030 at 3.00% for 5 cr\n"
+            "#2 [10:02:00] Trader B: closed\n"
+        )
+        deal_3 = concluded_deal()
+        deal_3["ytm"] = "3.00%"
+        result_3 = pipeline.validate_extraction(deal_3, snippet_3)
+        self.assertEqual(result_3["ytm"], 3.0)
+        self.assertNotIn("yield_out_of_expected_range", result_3["warnings"])
+
+        snippet_25 = (
+            "Chat: Synthetic Desk\n"
+            "Type: GROUP\n"
+            "Date: 2026-10-20\n"
+            "#1 [10:00:00] [OWN] Desk: Offering Synthetic GS Aug 2030 at 25.00% for 5 cr\n"
+            "#2 [10:02:00] Trader B: closed\n"
+        )
+        deal_25 = concluded_deal()
+        deal_25["ytm"] = "25.00%"
+        result_25 = pipeline.validate_extraction(deal_25, snippet_25)
+        self.assertEqual(result_25["ytm"], 25.0)
+        self.assertNotIn("yield_out_of_expected_range", result_25["warnings"])
+
+    def test_partial_isin_fragment_moves_to_partial_isin_text_and_sets_isin_null(self):
+        deal = concluded_deal()
+        deal["isin_text"] = "12345"
+        result = pipeline.validate_extraction(deal, SNIPPET)
+        self.assertIsNone(result["isin_text"])
+        self.assertEqual(result["partial_isin_text"], "12345")
+        self.assertIn("partial_isin", result["warnings"])
+
+    def test_invalid_checksum_isin_moves_to_partial_isin_text_and_sets_isin_null(self):
+        deal = concluded_deal()
+        deal["isin_text"] = "US0378331006"
+        result = pipeline.validate_extraction(deal, SNIPPET)
+        self.assertIsNone(result["isin_text"])
+        self.assertEqual(result["partial_isin_text"], "US0378331006")
+        self.assertIn("partial_isin", result["warnings"])
+
+    def test_full_valid_isin_retains_isin_text_without_partial_isin_warning(self):
+        snippet = (
+            "Chat: Synthetic Desk\n"
+            "Type: GROUP\n"
+            "Date: 2026-10-20\n"
+            "#1 [10:00:00] [OWN] Desk: Offering 5 cr US0378331005 at 10.08\n"
+            "#2 [10:02:00] Trader B: closed\n"
+        )
+        deal = concluded_deal()
+        deal["isin_text"] = "US0378331005"
+        deal["evidence"]["isin_text"] = ["#1"]
+        result = pipeline.validate_extraction(deal, snippet)
+        self.assertEqual(result["isin_text"], "US0378331005")
+        self.assertIsNone(result["partial_isin_text"])
+        self.assertNotIn("partial_isin", result["warnings"])
+        self.assertNotIn("unsupported_isin_text", result["warnings"])
+
+    def test_acceptance_after_earliest_term_line_allows_concluded_status(self):
+        snippet = (
+            "Chat: Synthetic Desk\n"
+            "Type: GROUP\n"
+            "Date: 2026-10-20\n"
+            "#1 [10:00:00] [OWN] Desk: Offering 5 cr Synthetic GS Aug 2030 T+1\n"
+            "#2 [10:01:00] [OWN] Desk: Level is 10.08%\n"
+            "#3 [10:02:00] Trader B: Checking\n"
+            "#4 [10:03:00] Trader B: closed\n"
+            "#5 [10:04:00] Trader B: ok\n"
+            "#6 [10:05:00] [OWN] Desk: Thanks\n"
+            "#7 [10:06:00] Trader B: Details sent\n"
+            "#8 [10:07:00] [OWN] Desk: Noted\n"
+            "#9 [10:08:00] Trader B: Confirmed at 10.08%\n"
+        )
+        deal = concluded_deal()
+        deal["ytm"] = "10.08%"
+        deal["evidence"]["ytm"] = ["#2", "#9"]
+        deal["evidence"]["status_evidence"] = ["#4"]
+        deal["status_evidence"] = "closed"
+        result = pipeline.validate_extraction(deal, snippet)
+        self.assertEqual(result["status"], "CONCLUDED")
+        self.assertNotIn("later_acceptance_evidence", result["missing_fields"])
+        self.assertNotIn("conclusion_downgraded", result["warnings"])
+
 
 if __name__ == "__main__":
     unittest.main()

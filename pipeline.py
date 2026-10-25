@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 import config
 from normalize import (
+    is_valid_isin,
     normalize_maturity,
     normalize_quantity,
     normalize_yield_coupon,
@@ -977,7 +978,10 @@ def _context_safe_text(value: Any, private_numbers: List[str]) -> str:
     for number in private_numbers:
         if number:
             text = re.sub(re.escape(number), "[phone]", text, flags=re.IGNORECASE)
-    return _PHONE_NUMBER_RE.sub("[phone]", text)
+    return _PHONE_NUMBER_RE.sub(
+    lambda m: "[phone]" if sum(ch.isdigit() for ch in m.group(0)) >= 10 else m.group(0),
+    text,
+)
 
 
 def format_context_snippet(
@@ -1042,12 +1046,13 @@ class DealExtraction(BaseModel):
 
     bond_identity_text: Optional[str] = None
     isin_text: Optional[str] = None
+    partial_isin_text: Optional[str] = None
     issuer_text: Optional[str] = None
     maturity_text: Optional[str] = None
     coupon_rate: Optional[float] = None
     credit_rating: Optional[str] = None
     quantity_text: Optional[str] = None
-    ytm: Optional[str] = None
+    ytm: Optional[Union[float, str]] = None
     ytm_is_two_way: Optional[bool] = None
     price: Optional[float] = None
     settlement_text: Optional[str] = None
@@ -1089,7 +1094,7 @@ state a value. Preserve text exactly as written for *_text fields. Do not
 convert maturity to a date, derive quantities, or infer any missing term.
 bond_identity_text requires bond-specific identity evidence; an issuer name
 alone is never a bond identity. Set price only for an explicitly stated clean
-price, never for a yield.
+price, never for a yield. A number after an ISIN joined by a hyphen (for example "<ISIN> - 43") is a unit count, never a yield.
 
 For every non-null value, evidence maps its field name to one or more exact
 numbered conversation lines such as ["#2", "#4"]. Do not invent line numbers.
@@ -1279,13 +1284,24 @@ def _same_number(left: str, right: str) -> bool:
 
 
 def _numbered_lines(context_snippet: Optional[str]) -> Dict[str, str]:
+    """Map '#n' to the full message text, including indented continuation lines.
+    Quoted 'replying to:' lines are excluded: they belong to another message."""
     if not context_snippet:
         return {}
-    return {
-        match.group(1): match.group(0).strip()
-        for line in context_snippet.splitlines()
-        if (match := re.match(r"^\s*(#\d+)\s+\[[^\]]+\]\s+(.*)$", line))
-    }
+    result: Dict[str, str] = {}
+    current = None
+    for line in context_snippet.splitlines():
+        header = re.match(r"^\s*(#\d+)\s+\[[^\]]+\]\s+(.*)$", line)
+        if header and not line.startswith("    "):
+            current = header.group(1)
+            result[current] = line.strip()
+        elif current and line.startswith("    "):
+            if line.strip().lower().startswith("replying to:"):
+                continue
+            result[current] += "\n" + line.strip()
+        else:
+            current = None
+    return result
 
 
 def _field_evidence_lines(
@@ -1409,7 +1425,7 @@ def _evidence_check(
     cited_lines: Dict[str, List[str]] = {}
 
     for field, value in list(deal.items()):
-        if field in {"evidence", "status_evidence"} or value is None:
+        if field in {"evidence", "status_evidence", "partial_isin_text"} or value is None:
             continue
         selected_lines = _field_evidence_lines(field, value, evidence, lines)
         cited_lines[field] = selected_lines
@@ -1509,17 +1525,47 @@ def _normalize_extracted_fields(
         needs_review = True
 
     ytm_text = deal.get("ytm")
-    yield_result = (
-        normalize_yield_coupon(f"YTM {ytm_text}")
-        if ytm_text is not None
-        else {"yields": [], "two_way_quotes": [], "warnings": []}
-    )
-    deal["ytm_values"] = yield_result["yields"]
-    if yield_result["two_way_quotes"]:
-        deal["ytm_is_two_way"] = True
-    warnings.extend("yield_out_of_expected_range" for _ in yield_result["warnings"])
-    if yield_result["warnings"]:
-        needs_review = True
+    if ytm_text is not None:
+        clean_ytm = str(ytm_text).replace("%", "").strip()
+        parsed_number = None
+        try:
+            parsed_number = float(clean_ytm)
+        except ValueError:
+            pass
+
+        yield_result = normalize_yield_coupon(f"YTM {ytm_text}")
+        deal["ytm_values"] = yield_result["yields"]
+        if yield_result["two_way_quotes"]:
+            deal["ytm_is_two_way"] = True
+
+        is_out_of_range = False
+        if parsed_number is not None:
+            if not (3.0 <= parsed_number <= 25.0):
+                is_out_of_range = True
+        elif yield_result["yields"]:
+            if any(not (3.0 <= y <= 25.0) for y in yield_result["yields"]):
+                is_out_of_range = True
+        elif yield_result["warnings"]:
+            is_out_of_range = True
+
+        if is_out_of_range:
+            deal["ytm"] = None
+            deal["ytm_values"] = []
+            if "yield_out_of_expected_range" not in warnings:
+                warnings.append("yield_out_of_expected_range")
+            needs_review = True
+        else:
+            if parsed_number is not None:
+                deal["ytm"] = parsed_number
+            elif yield_result["yields"] and not yield_result["two_way_quotes"]:
+                deal["ytm"] = yield_result["yields"][0]
+            elif clean_ytm:
+                deal["ytm"] = clean_ytm
+            else:
+                deal["ytm"] = None
+    else:
+        deal["ytm"] = None
+        deal["ytm_values"] = []
 
     settlement_text = deal.get("settlement_text")
     settlement_citations = (
@@ -1581,24 +1627,7 @@ def _conclusion_check(
     if not side_present:
         missing.append("owner_side_or_buyer_text_or_seller_text")
 
-    term_fields = [
-        "bond_identity_text",
-        "isin_text",
-        "issuer_text",
-        "maturity_text",
-        "coupon_rate",
-        "credit_rating",
-        "ytm",
-        "price",
-        "quantity_text",
-        "settlement_text",
-        "rfq_id",
-    ]
-    term_fields.extend(
-        ["owner_side"]
-        if deal.get("owner_side") is not None
-        else ["buyer_text", "seller_text"]
-    )
+    term_fields = ["ytm", "price"]
     term_line_numbers = [
         int(match.group(1))
         for field in term_fields
@@ -1613,7 +1642,7 @@ def _conclusion_check(
         if (match := re.match(r"#(\d+)", line)) is not None
     ]
     has_later_acceptance = any(
-        number > max(term_line_numbers, default=0) and _ACCEPTANCE_RE.search(line)
+        number > min(term_line_numbers, default=0) and _ACCEPTANCE_RE.search(line)
         for number, line in acceptance_numbered
     )
     if not has_later_acceptance:
@@ -1647,6 +1676,24 @@ def validate_extraction(
 
     errors: List[str] = []
     warnings: List[str] = []
+
+    isin_text = validated.get("isin_text")
+    if isin_text is not None and str(isin_text).strip():
+        raw_isin = str(isin_text).strip()
+        if not is_valid_isin(raw_isin):
+            validated["partial_isin_text"] = isin_text
+            validated["isin_text"] = None
+            warnings.append("partial_isin")
+            if isinstance(validated.get("evidence"), dict) and "isin_text" in validated["evidence"]:
+                validated["evidence"]["partial_isin_text"] = validated["evidence"].get("isin_text")
+        else:
+            validated["isin_text"] = raw_isin
+            validated["partial_isin_text"] = None
+    else:
+        validated["isin_text"] = None
+        if not validated.get("partial_isin_text"):
+            validated["partial_isin_text"] = None
+
     verified, evidence_warnings, cited_lines = _evidence_check(
         validated,
         context_snippet,
