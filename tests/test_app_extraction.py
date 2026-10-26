@@ -85,6 +85,8 @@ class AppExtractionTests(unittest.IsolatedAsyncioTestCase):
                     "extraction_failed": True,
                     "raw_text": "synthetic raw response",
                     "error": "invalid response",
+                    "error_category": "invalid_model_response",
+                    "correlation_id": "synthetic-correlation-id",
                     "prompt_version": "test",
                 },
                 {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
@@ -132,23 +134,31 @@ class AppExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["needs_review_count"], 1)
         self.assertEqual(
             report["context_errors"][0]["raw_llm_output"],
-            "synthetic raw response",
+            None,
         )
+        self.assertEqual(
+            report["context_errors"][0]["error_category"],
+            "invalid_model_response",
+        )
+        self.assertTrue(report["context_errors"][0]["correlation_id"])
         deal = report["extractions"][1]
         self.assertEqual(deal["chat_key"], "CHAT:test")
         self.assertEqual(deal["chat_name"], "Synthetic")
         self.assertEqual(deal["chat_type"], "GROUP")
         self.assertEqual(deal["message_ids"], ["message-later"])
 
-        with patch.object(
-            app.db,
-            "persist_upload",
-            return_value={
-                "messages_stored": 1,
-                "bonds_stored": 0,
-                "transactions_stored": 1,
-            },
-        ) as persist_upload:
+        with (
+            patch.object(
+                app.db,
+                "persist_upload",
+                return_value={
+                    "messages_stored": 1,
+                    "bonds_stored": 0,
+                    "transactions_stored": 1,
+                    "transaction_ids": ["synthetic-transaction-id"],
+                },
+            ) as persist_upload,
+        ):
             await app.store_extracted_data(upload_id)
 
         stored_deal = next(
@@ -160,6 +170,10 @@ class AppExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             persist_upload.call_args.kwargs["context_message_maps"]["later"],
             {"#1": "message-later"},
+        )
+        self.assertEqual(
+            len(persist_upload.call_args.kwargs["identification_results"]),
+            1,
         )
 
     async def test_empty_extraction_returns_the_complete_report_shape(self):

@@ -10,6 +10,7 @@ Connects the Chat-style UI to the Python backend with:
 """
 
 import hashlib
+import logging
 import os
 import time
 import uuid
@@ -26,8 +27,19 @@ import config
 import db
 import pipeline
 import privacy
+from bond_matching import BondMatchResult
+from bond_reference import BondReferenceError, get_bond_reference_index
+from bond_identification import identification_summary
 
 app = FastAPI(title="Bond Trade Extraction App", version="1.0.0")
+logger = logging.getLogger(__name__)
+
+
+class _ContextExtractionFailure(RuntimeError):
+    def __init__(self, error_category: str, correlation_id: str) -> None:
+        super().__init__("Context extraction failed.")
+        self.error_category = error_category
+        self.correlation_id = correlation_id
 
 app.add_middleware(
     CORSMiddleware,
@@ -84,8 +96,9 @@ async def upload_file(file: UploadFile = File(...)):
     try:
         content_bytes = await file.read()
         raw_text = content_bytes.decode("utf-8", errors="replace")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
+    except Exception:
+        logger.exception("Failed to read uploaded file")
+        raise HTTPException(status_code=400, detail="Failed to read uploaded file.")
 
     upload_id = str(uuid.uuid4())
     filename = file.filename or "chat_export.txt"
@@ -149,6 +162,7 @@ async def extract_trades(upload_id: str):
     )
     contexts.sort(key=lambda context: context["start"])
     extractions = []
+    identification_results: List[Optional[BondMatchResult]] = []
     context_errors = []
     total_prompt_tokens = 0
     total_completion_tokens = 0
@@ -164,6 +178,18 @@ async def extract_trades(upload_id: str):
     }
     processed_contexts = 0
     failed_contexts = 0
+    reference_index = None
+    reference_error = None
+    if selected_contexts:
+        try:
+            reference_index = get_bond_reference_index()
+        except BondReferenceError:
+            logger.error(
+                "Bond reference data is unavailable; check BOND_REFERENCE_CSV."
+            )
+            reference_error = (
+                "Bond reference data is unavailable. Check BOND_REFERENCE_CSV."
+            )
 
     for ctx in selected_contexts:
         extraction_result: Dict[str, Any] = {}
@@ -185,8 +211,11 @@ async def extract_trades(upload_id: str):
             max_single_call_tokens = max(max_single_call_tokens, tot_tk)
 
             if extraction_result.get("extraction_failed"):
-                raise RuntimeError(
-                    str(extraction_result.get("error") or "Extraction failed")
+                raise _ContextExtractionFailure(
+                    error_category=extraction_result.get("error_category")
+                    or "model_extraction_failed",
+                    correlation_id=extraction_result.get("correlation_id")
+                    or str(uuid.uuid4()),
                 )
 
             context_datetime = max(
@@ -205,6 +234,13 @@ async def extract_trades(upload_id: str):
                     context_snippet=ctx["snippet_text"],
                     message_datetime=context_datetime,
                 )
+                if validated_deal.get("extraction_failed"):
+                    validated_deal.pop("raw_text", None)
+                    validated_deal["error"] = (
+                        "A model deal could not be validated."
+                    )
+                    validated_deal["error_category"] = "invalid_extracted_deal"
+                    validated_deal["correlation_id"] = str(uuid.uuid4())
                 validated_deal = privacy.restore_pii(
                     validated_deal,
                     ctx.get("privacy_map", {}),
@@ -223,22 +259,42 @@ async def extract_trades(upload_id: str):
                     "prompt_version": extraction_result["prompt_version"],
                     "model_name": pipeline.MODEL_NAME,
                 })
+                match_result = pipeline.identify_extracted_bond(
+                    validated_deal,
+                    parsed_messages,
+                    ctx["message_number_map"],
+                    reference_index,
+                    reference_error,
+                )
+                validated_deal["identification"] = identification_summary(
+                    match_result
+                )
+                identification_results.append(match_result)
                 extractions.append(validated_deal)
             processed_contexts += 1
         except Exception as error:
+            error_category = (
+                error.error_category
+                if isinstance(error, _ContextExtractionFailure)
+                else "context_processing_failed"
+            )
+            correlation_id = (
+                error.correlation_id
+                if isinstance(error, _ContextExtractionFailure)
+                else str(uuid.uuid4())
+            )
+            logger.warning(
+                "Context extraction failed: category=%s correlation_id=%s",
+                error_category,
+                correlation_id,
+            )
             failed_contexts += 1
-            raw_output = extraction_result.get(
-                "raw_text",
-                extraction_result.get("raw_output"),
-            )
-            raw_output = privacy.restore_pii(
-                raw_output,
-                ctx.get("privacy_map", {}),
-            )
             context_error = {
                 "context_id": ctx["context_id"],
-                "error": str(error),
-                "raw_llm_output": raw_output,
+                "error": "Extraction failed for this context.",
+                "error_category": error_category,
+                "correlation_id": correlation_id,
+                "raw_llm_output": None,
                 "call_tokens": tokens,
                 "chat_key": ctx["chat_key"],
                 "chat_name": ctx["chat_name"],
@@ -246,6 +302,7 @@ async def extract_trades(upload_id: str):
                 "message_ids": ctx["message_ids"],
             }
             context_errors.append(context_error)
+            identification_results.append(None)
             extractions.append({
                 "extraction_failed": True,
                 **context_error,
@@ -284,6 +341,13 @@ async def extract_trades(upload_id: str):
         for deal in extractions
         if not deal.get("extraction_failed")
     ).items()))
+    identification_by_status = dict(sorted(Counter(
+        deal["identification"]["status"]
+        for deal in extractions
+        if not deal.get("extraction_failed")
+        and isinstance(deal.get("identification"), dict)
+        and deal["identification"].get("status")
+    ).items()))
     parse_report = session.get("parse_report", {})
     system_count = sum(
         bool(message.get("is_system"))
@@ -292,6 +356,7 @@ async def extract_trades(upload_id: str):
 
     # Save to session
     session["extractions"] = extractions
+    session["identification_results"] = identification_results
     session["token_usage"] = token_usage
     session["context_window"] = context_window
     session["context_message_maps"] = context_message_maps
@@ -323,6 +388,8 @@ async def extract_trades(upload_id: str):
         "failed": failed_contexts,
         "context_errors": context_errors,
         "deals_by_status": deals_by_status,
+        "identification_by_status": identification_by_status,
+        "bond_reference_error": reference_error,
         "needs_review_count": sum(
             bool(deal.get("needs_review"))
             for deal in extractions
@@ -349,6 +416,25 @@ async def store_extracted_data(upload_id: str, update_existing: bool = False):
     extractions = session.get("extractions", [])
 
     try:
+        session_identification_results = session.get(
+            "identification_results",
+            [],
+        )
+        identification_results = []
+        for index, deal in enumerate(extractions):
+            if deal.get("extraction_failed"):
+                continue
+            if index >= len(session_identification_results):
+                raise RuntimeError(
+                    "Identification result is missing for an extracted deal."
+                )
+            match_result = session_identification_results[index]
+            if not isinstance(match_result, BondMatchResult):
+                raise RuntimeError(
+                    "Identification result is unavailable for an extracted deal."
+                )
+            identification_results.append(match_result)
+
         counts = db.persist_upload(
             db_path=db.DB_PATH,
             chat_id=upload_id,
@@ -359,6 +445,13 @@ async def store_extracted_data(upload_id: str, update_existing: bool = False):
             model_name=session.get("model_name"),
             source_hash=session.get("source_hash"),
             update_existing=update_existing,
+            defer_bond_creation=True,
+            identification_results=identification_results,
+        )
+
+        identification_counts: Dict[str, int] = counts.get(
+            "identification_by_status",
+            {},
         )
 
         messages_inserted = counts.get(
@@ -402,10 +495,16 @@ async def store_extracted_data(upload_id: str, update_existing: bool = False):
                 "transactions_stored",
                 transactions_inserted + transactions_updated,
             ),
+            "identification_by_status": identification_counts,
+            "identification_skipped": counts.get("identification_skipped", 0),
             "message": message,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database storage failed: {e}")
+    except Exception:
+        logger.exception("Database storage failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Database storage failed.",
+        )
 
 
 @app.get("/data")
@@ -413,8 +512,12 @@ def get_database_records():
     """Retrieve all current records in SQLite for interactive database inspector."""
     try:
         return db.fetch_database_data(db.DB_PATH)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch database data: {e}")
+    except Exception:
+        logger.exception("Failed to fetch database data")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to fetch database data.",
+        )
 
 
 @app.get("/samples")

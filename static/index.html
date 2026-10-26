@@ -99,13 +99,6 @@
         onclick="document.getElementById('fileUploadInput').click()"
       >
 
-      <button
-        class="btn btn-primary"
-        onclick="document.getElementById('fileUploadInput').click()"
-      >
-        Upload File
-      </button>
-
     </div>
   </div>
 
@@ -534,6 +527,7 @@
               ? d.missing_fields
               : [];
             const evidenceHtml = renderEvidence(d.evidence);
+            const identification = d.identification || {};
             const needsReviewHtml = d.needs_review
               ? '<span class="badge badge-review">Needs review</span>'
               : '<span class="badge badge-reviewed">Reviewed</span>';
@@ -551,10 +545,12 @@
                       <span class="spec-label">Error</span>
                       <span class="spec-value">${escapeHtml(d.error || 'Unable to parse model output')}</span>
                     </div>
-                    <div class="spec-item">
-                      <span class="spec-label">Raw model output</span>
-                      <span class="spec-value">${escapeHtml(d.raw_text || '')}</span>
-                    </div>
+                    ${d.error_category
+                      ? `<div class="spec-item"><span class="spec-label">Failure category</span><span class="spec-value">${escapeHtml(d.error_category)}</span></div>`
+                      : ''}
+                    ${d.correlation_id
+                      ? `<div class="spec-item"><span class="spec-label">Correlation ID</span><span class="spec-value">${escapeHtml(d.correlation_id)}</span></div>`
+                      : ''}
                   </div>
                 </div>
               `;
@@ -627,7 +623,7 @@
 
                   <div class="spec-item">
                     <span class="spec-label">
-                      Price / Yield
+                      Price (clean)
                     </span>
 
                     <span class="spec-value highlight">
@@ -672,6 +668,20 @@
                   <div><strong>Evidence lines:</strong>
                     ${evidenceHtml || '—'}
                   </div>
+                  <div><strong>Bond identification:</strong>
+                    ${identification.status
+                      ? `<span class="badge ${statusBadgeClass(identification.status)}">${escapeHtml(identification.status)}</span>`
+                      : '—'}
+                    ${identification.explanation
+                      ? `<div>${escapeHtml(identification.explanation)}</div>`
+                      : ''}
+                    ${identification.matched_isin
+                      ? `<div>Matched ISIN: ${escapeHtml(identification.matched_isin)}</div>`
+                      : ''}
+                    ${identification.candidate_isins && identification.candidate_isins.length
+                      ? `<div>Candidates: ${escapeHtml(identification.candidate_isins.join(', '))}</div>`
+                      : ''}
+                  </div>
                 </div>
               </div>
             `;
@@ -709,12 +719,9 @@
         appendMessage(`
           <div>
 
-            <strong>Stored successfully</strong> —
-
-            ${storeData.messages_stored} messages,
-            ${storeData.bonds_stored} bonds, and
-            ${storeData.transactions_stored} transactions
-            saved to database.
+            ${storeData.already_stored
+              ? `<strong>Already stored</strong> — no records changed. This extraction was not applied; ${storeData.transactions_skipped} transaction(s) and ${storeData.identification_skipped} identification result(s) were skipped.`
+              : `<strong>Stored successfully</strong> — ${storeData.messages_stored} messages, ${storeData.bonds_stored} bonds, and ${storeData.transactions_stored} transactions saved to database.`}
 
             <div style="margin-top: 10px;">
 
@@ -876,7 +883,7 @@
               <strong>
                 ${escapeHtml(
                   r.bond_identity ||
-                  r.bond_id.substring(0, 8)
+                  (r.bond_id ? r.bond_id.substring(0, 8) : 'Unresolved bond')
                 )}
               </strong>
             </td>
@@ -929,6 +936,10 @@
                 ${escapeHtml(r.status ?? '—')}
               </span>
               ${r.needs_review ? '<span class="badge badge-review">Needs review</span>' : ''}
+            </td>
+
+            <td>
+              ${escapeHtml(r.identification_status || '—')}
             </td>
 
             <td>
@@ -998,6 +1009,7 @@
                   <th>Settlement</th>
                   <th>Settlement date</th>
                   <th>Status</th>
+                  <th>Bond identification</th>
                   <th>Needs review</th>
                   <th>Confidence</th>
                   <th>Missing fields</th>
@@ -1146,9 +1158,11 @@
 
             <td class="mono-cell">
               ${
-                r.transaction_id
-                  ? r.transaction_id.substring(0, 8) + '...'
-                  : '<span style="color: #94a3b8;">null</span>'
+                Array.isArray(r.transaction_ids) && r.transaction_ids.length
+                  ? r.transaction_ids
+                      .map(transactionId => escapeHtml(`${transactionId.substring(0, 8)}...`))
+                      .join(', ')
+                  : '—'
               }
             </td>
 

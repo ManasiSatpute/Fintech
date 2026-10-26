@@ -8,15 +8,19 @@ Implements the exact SQLite schema required:
 
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from bond_matching import BondMatchResult, BondMatchStatus
+from bond_reference import normalize_issuer_key
+from isin_utils import IsinStatus, normalize_isin_candidate
 import config
 
 DB_PATH = "bond_deals.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 # Exact DDL specified in requirements
 SCHEMA_SQL = """
@@ -55,7 +59,7 @@ CREATE TABLE IF NOT EXISTS bonds (
 CREATE TABLE IF NOT EXISTS transactions (
     transaction_id        TEXT PRIMARY KEY,   -- UUID
     source_hash            TEXT,
-    bond_id                TEXT NOT NULL,
+    bond_id                TEXT,
     buyer                   TEXT,
     seller                  TEXT,
     quantity                REAL,
@@ -73,6 +77,7 @@ CREATE TABLE IF NOT EXISTS transactions (
             'INITIATED','NEGOTIATING','CONCLUDED','CANCELLED','UNCERTAIN','DISCARDED'
         )
     ),
+    identification_status             TEXT,
     created_at                          TEXT NOT NULL,
     updated_at                           TEXT NOT NULL,
     context_id                          TEXT,
@@ -109,6 +114,29 @@ CREATE TABLE IF NOT EXISTS transaction_messages (
     FOREIGN KEY (transaction_id) REFERENCES transactions (transaction_id),
     FOREIGN KEY (message_id) REFERENCES messages (message_id)
 );
+
+CREATE TABLE IF NOT EXISTS identification_audit (
+    audit_id                 TEXT PRIMARY KEY,
+    transaction_id           TEXT NOT NULL,
+    identification_status    TEXT,
+    matching_method          TEXT,
+    reason                   TEXT,
+    normalized_isin          TEXT,
+    raw_issuer_text          TEXT,
+    normalized_issuer_key    TEXT,
+    evidence_json            TEXT,
+    candidates_json          TEXT,
+    decision_key             TEXT,
+    created_at               TEXT NOT NULL,
+    FOREIGN KEY (transaction_id) REFERENCES transactions (transaction_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_identification_audit_decision
+    ON identification_audit (transaction_id, decision_key);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bonds_isin_unique_not_null
+    ON bonds (isin)
+    WHERE isin IS NOT NULL;
 """
 
 SCHEMA_VERSION_SQL = """
@@ -120,86 +148,317 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 
 def get_db_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(
+        db_path,
+        timeout=30.0,
+        isolation_level="DEFERRED",
+    )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        foreign_keys_enabled = conn.execute("PRAGMA foreign_keys").fetchone()
+        if foreign_keys_enabled is None or foreign_keys_enabled[0] != 1:
+            raise RuntimeError("SQLite foreign-key enforcement could not be enabled.")
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
+def _migration_3(conn: sqlite3.Connection) -> None:
+    transaction_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(transactions)")
+    }
+    if "source_hash" not in transaction_columns:
+        conn.execute("ALTER TABLE transactions ADD COLUMN source_hash TEXT")
+    if "deal_index" not in transaction_columns:
+        conn.execute("ALTER TABLE transactions ADD COLUMN deal_index INTEGER")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_source_context_deal
+        ON transactions (source_hash, context_id, deal_index)
+        """
+    )
+
+
+def _migration_4(conn: sqlite3.Connection) -> None:
+    existing_tables = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    if "transactions" not in existing_tables or "bonds" not in existing_tables:
+        raise RuntimeError(
+            "Cannot apply SQLite migration 4: required transactions or bonds "
+            "table is missing."
+        )
+
+    transaction_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(transactions)")
+    }
+    if "identification_status" not in transaction_columns:
+        conn.execute(
+            "ALTER TABLE transactions ADD COLUMN identification_status TEXT"
+        )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS identification_audit (
+            audit_id TEXT PRIMARY KEY,
+            transaction_id TEXT NOT NULL,
+            identification_status TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (transaction_id)
+                REFERENCES transactions (transaction_id)
+        )
+        """
+    )
+
+    duplicate_isin_groups = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM (
+            SELECT isin
+            FROM bonds
+            WHERE isin IS NOT NULL
+            GROUP BY isin
+            HAVING COUNT(*) > 1
+        )
+        """
+    ).fetchone()[0]
+    if duplicate_isin_groups:
+        raise RuntimeError(
+            "Cannot create the unique non-null ISIN index: "
+            f"{duplicate_isin_groups} duplicate ISIN group(s) exist. "
+            "No bond or transaction rows were changed; resolve duplicates "
+            "manually using the documented procedure, then retry."
+        )
+
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_bonds_isin_unique_not_null
+        ON bonds (isin)
+        WHERE isin IS NOT NULL
+        """
+    )
+
+
+def _migration_5(conn: sqlite3.Connection) -> None:
+    transaction_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("transactions",),
+    ).fetchone()
+    if transaction_sql_row is None or not transaction_sql_row["sql"]:
+        raise RuntimeError(
+            "Cannot apply SQLite migration 5: transactions table definition is missing."
+        )
+
+    transaction_sql = transaction_sql_row["sql"]
+    nullable_sql, replacements = re.subn(
+        r"(?im)^(\s*b ond_id\s+TEXT)\s+NOT\s+NULL\b".replace(" ", ""),
+        r"\1",
+        transaction_sql,
+        count=1,
+    )
+    if replacements != 1:
+        raise RuntimeError(
+            "Cannot apply SQLite migration 5: transactions.bond_id is not "
+            "a recognized NOT NULL column."
+        )
+
+    dependent_schema = conn.execute(
+        """
+        SELECT type, sql
+        FROM sqlite_master
+        WHERE tbl_name = ? AND type IN ('index', 'trigger') AND sql IS NOT NULL
+        """,
+        ("transactions",),
+    ).fetchall()
+    old_table_name = re.compile(r"(?i)\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?transactions\b")
+    replacement_sql, table_replacements = old_table_name.subn(
+        "CREATE TABLE transactions_phase5_new",
+        nullable_sql,
+        count=1,
+    )
+    if table_replacements != 1:
+        raise RuntimeError(
+            "Cannot apply SQLite migration 5: transactions table could not be "
+            "safely rebuilt."
+        )
+
+    conn.execute(replacement_sql)
+    column_names = [
+        row["name"] for row in conn.execute("PRAGMA table_info(transactions)")
+    ]
+    columns_sql = ", ".join(f'"{name}"' for name in column_names)
+    conn.execute(
+        f"INSERT INTO transactions_phase5_new ({columns_sql}) "
+        f"SELECT {columns_sql} FROM transactions"
+    )
+    conn.execute("DROP TABLE transactions")
+    conn.execute(
+        "ALTER TABLE transactions_phase5_new RENAME TO transactions"
+    )
+    for schema_object in dependent_schema:
+        conn.execute(schema_object["sql"])
+
+    audit_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(identification_audit)")
+    }
+    audit_additions = {
+        "matching_method": "TEXT",
+        "reason": "TEXT",
+        "normalized_isin": "TEXT",
+        "raw_issuer_text": "TEXT",
+        "normalized_issuer_key": "TEXT",
+        "evidence_json": "TEXT",
+        "candidates_json": "TEXT",
+        "decision_key": "TEXT",
+    }
+    for column, column_type in audit_additions.items():
+        if column not in audit_columns:
+            conn.execute(
+                f"ALTER TABLE identification_audit "
+                f"ADD COLUMN {column} {column_type}"
+            )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_identification_audit_decision
+        ON identification_audit (transaction_id, decision_key)
+        """
+    )
+
+    bond_id_column = next(
+        (
+            row for row in conn.execute("PRAGMA table_info(transactions)")
+            if row["name"] == "bond_id"
+        ),
+        None,
+    )
+    if bond_id_column is None or bond_id_column["notnull"]:
+        raise RuntimeError(
+            "SQLite migration 5 did not make transactions.bond_id nullable."
+        )
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(
+            "SQLite migration 5 detected foreign-key violations; migration rolled back."
+        )
+
+
+MIGRATIONS = {
+    3: _migration_3,
+    4: _migration_4,
+    5: _migration_5,
+}
+
+
 def init_db(db_path: str = DB_PATH) -> None:
-    """Initialize the current schema, refusing implicit legacy migrations."""
+    """Create a new schema or apply versioned, transactional SQLite migrations."""
     conn = get_db_connection(db_path)
     try:
         existing_tables = {
             row["name"]
             for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
             )
         }
-        conn.executescript(SCHEMA_VERSION_SQL)
+        if not existing_tables:
+            try:
+                conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_SQL)
+                conn.execute(SCHEMA_VERSION_SQL)
+                conn.execute(
+                    "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                    (SCHEMA_VERSION, datetime.now().isoformat()),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            return
+
+        if "schema_version" not in existing_tables:
+            raise RuntimeError(
+                "Database has no schema version; its existing schema is unknown. "
+                "No tables or rows were changed."
+            )
+
         version_row = conn.execute(
             "SELECT version FROM schema_version ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
-        if version_row is None and existing_tables:
+        if version_row is None:
             raise RuntimeError(
-                "Database has no schema version and may use an older schema; "
-                "run reset_db(db_path) to recreate it (development only)."
+                "Database schema_version table is empty. No tables or rows were changed."
             )
-        if version_row is not None and version_row["version"] < SCHEMA_VERSION:
-            if version_row["version"] == 2:
-                try:
-                    conn.execute("BEGIN TRANSACTION")
-                    transaction_columns = {
-                        row["name"]
-                        for row in conn.execute(
-                            "PRAGMA table_info(transactions)"
-                        )
-                    }
-                    if "source_hash" not in transaction_columns:
-                        conn.execute(
-                            "ALTER TABLE transactions ADD COLUMN source_hash TEXT"
-                        )
-                    if "deal_index" not in transaction_columns:
-                        conn.execute(
-                            "ALTER TABLE transactions ADD COLUMN deal_index INTEGER"
-                        )
-                    conn.execute(
-                        """
-                        CREATE UNIQUE INDEX IF NOT EXISTS
-                            idx_transactions_source_context_deal
-                        ON transactions (source_hash, context_id, deal_index)
-                        """
-                    )
-                    conn.execute(
-                        "UPDATE schema_version SET version = ?, applied_at = ?",
-                        (SCHEMA_VERSION, datetime.now().isoformat()),
-                    )
-                    conn.commit()
-                    version_row = conn.execute(
-                        "SELECT version FROM schema_version "
-                        "ORDER BY rowid DESC LIMIT 1"
-                    ).fetchone()
-                except Exception:
-                    conn.rollback()
-                    raise
-            else:
-                raise RuntimeError(
-                    f"Database schema version {version_row['version']} is older "
-                    f"than required version {SCHEMA_VERSION}; run reset_db(db_path) "
-                    "to recreate it (development only)."
-                )
-        if version_row is not None and version_row["version"] > SCHEMA_VERSION:
+        current_version = version_row["version"]
+        if current_version > SCHEMA_VERSION:
             raise RuntimeError(
-                f"Database schema version {version_row['version']} is newer than "
+                f"Database schema version {current_version} is newer than "
                 f"supported version {SCHEMA_VERSION}."
             )
-        conn.executescript(SCHEMA_SQL)
-        if version_row is None:
-            conn.execute(
-                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
-                (SCHEMA_VERSION, datetime.now().isoformat()),
-            )
-        conn.commit()
+
+        for target_version in range(current_version + 1, SCHEMA_VERSION + 1):
+            migration = MIGRATIONS.get(target_version)
+            if migration is None:
+                raise RuntimeError(
+                    f"No SQLite migration is available for schema version "
+                    f"{target_version}."
+                )
+            foreign_keys_disabled_for_rebuild = target_version == 5
+            try:
+                if foreign_keys_disabled_for_rebuild:
+                    enabled = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+                    if enabled != 1:
+                        raise RuntimeError(
+                            "Cannot apply SQLite migration 5: foreign-key "
+                            "enforcement is not enabled."
+                        )
+                    conn.execute("PRAGMA foreign_keys = OFF")
+                    if conn.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
+                        raise RuntimeError(
+                            "Cannot apply SQLite migration 5: foreign-key "
+                            "enforcement could not be suspended for the table rebuild."
+                        )
+                conn.execute("BEGIN IMMEDIATE")
+                migration(conn)
+                conn.execute(
+                    "UPDATE schema_version SET version = ?, applied_at = ?",
+                    (target_version, datetime.now().isoformat()),
+                )
+                conn.commit()
+                if foreign_keys_disabled_for_rebuild:
+                    conn.execute("PRAGMA foreign_keys = ON")
+                    if conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+                        raise RuntimeError(
+                            "SQLite migration 5 committed, but foreign-key "
+                            "enforcement could not be restored."
+                        )
+                    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                    if violations:
+                        raise RuntimeError(
+                            "SQLite migration 5 committed, but foreign-key "
+                            "validation found violations."
+                        )
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                if foreign_keys_disabled_for_rebuild:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    conn.execute("PRAGMA foreign_keys = ON")
+
+        if current_version == SCHEMA_VERSION:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                _migration_4(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
     finally:
         conn.close()
 
@@ -207,9 +466,9 @@ def reset_db(db_path: str = DB_PATH) -> None:
     """Drop and recreate all tables. For development databases only."""
     conn = get_db_connection(db_path)
     try:
-        conn.execute("PRAGMA foreign_keys = OFF")
         for table in (
             "transaction_messages",
+            "identification_audit",
             "transactions",
             "bonds",
             "messages",
@@ -341,6 +600,44 @@ def _deterministic_transaction_id(
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
+def _transaction_ids_for_deals(
+    source_hash: Optional[str],
+    deals: List[Dict[str, Any]],
+    parsed_messages: List[Dict[str, Any]],
+) -> List[str]:
+    context_deal_indexes: Dict[str, int] = {}
+    transaction_ids = []
+    for deal in deals:
+        stable_context_id = _context_identity(deal, parsed_messages)
+        deal_index = context_deal_indexes.get(stable_context_id, 0)
+        context_deal_indexes[stable_context_id] = deal_index + 1
+        transaction_ids.append(
+            _deterministic_transaction_id(
+                source_hash,
+                stable_context_id,
+                deal_index,
+            )
+        )
+    return transaction_ids
+
+
+def _identification_status_counts(
+    conn: sqlite3.Connection,
+    transaction_ids: List[str],
+) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for transaction_id in transaction_ids:
+        row = conn.execute(
+            "SELECT identification_status FROM transactions "
+            "WHERE transaction_id = ?",
+            (transaction_id,),
+        ).fetchone()
+        if row is not None and row["identification_status"]:
+            status = row["identification_status"]
+            counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
 def persist_upload(
     db_path: str,
     chat_id: str,
@@ -351,10 +648,28 @@ def persist_upload(
     model_name: Optional[str] = None,
     source_hash: Optional[str] = None,
     update_existing: bool = False,
+    defer_bond_creation: bool = False,
+    identification_results: Optional[List[BondMatchResult]] = None,
 ) -> Dict[str, Any]:
     """
-    Persist all messages, distinct bonds, transactions, and deal/message links.
+    Persist an upload and its identification results atomically.
     """
+    valid_deals = [
+        deal for deal in validated_deals if not deal.get("extraction_failed")
+    ]
+    if identification_results is not None:
+        if len(identification_results) != len(valid_deals):
+            raise ValueError(
+                "Identification results must match the non-failed deals."
+            )
+        if any(
+            not isinstance(result, BondMatchResult)
+            for result in identification_results
+        ):
+            raise TypeError(
+                "Every identification result must be a BondMatchResult."
+            )
+
     init_db(db_path)
     conn = get_db_connection(db_path)
 
@@ -364,12 +679,11 @@ def persist_upload(
     transactions_stored = 0
     transactions_updated = 0
     transactions_skipped = 0
+    identification_write_allowed = []
+    identification_skipped = 0
 
     try:
         conn.execute("BEGIN TRANSACTION;")
-        valid_deals = [
-            deal for deal in validated_deals if not deal.get("extraction_failed")
-        ]
         if source_hash is not None:
             existing_source_rows = conn.execute(
                 "SELECT COUNT(*) FROM transactions WHERE source_hash = ?",
@@ -385,6 +699,20 @@ def persist_upload(
                     )
                 }
                 messages_already_present = len(existing_message_ids)
+                transaction_ids = _transaction_ids_for_deals(
+                    source_hash,
+                    valid_deals,
+                    parsed_messages,
+                )
+                identification_by_status = _identification_status_counts(
+                    conn,
+                    transaction_ids,
+                )
+                identification_skipped = (
+                    len(identification_results)
+                    if identification_results is not None
+                    else 0
+                )
                 conn.commit()
                 return {
                     "already_stored": True,
@@ -397,6 +725,9 @@ def persist_upload(
                     "transactions_updated": 0,
                     "transactions_skipped": len(valid_deals),
                     "transactions_stored": 0,
+                    "transaction_ids": transaction_ids,
+                    "identification_by_status": identification_by_status,
+                    "identification_skipped": identification_skipped,
                 }
 
         existing_message_ids = {
@@ -410,9 +741,10 @@ def persist_upload(
         messages_stored = insert_messages(conn, parsed_messages, chat_id)
         messages_already_present = len(existing_message_ids)
 
-        # IDENTITY-LADDER: bond identity resolution is intentionally unchanged.
+        # TODO: Replace upload-time bond identity resolution with explicit match persistence.
         now_iso = datetime.now().isoformat()
         context_deal_indexes: Dict[str, int] = {}
+        transaction_ids = []
 
         for deal in validated_deals:
             if deal.get("extraction_failed"):
@@ -426,10 +758,15 @@ def persist_upload(
                 stable_context_id,
                 deal_idx,
             )
+            transaction_ids.append(tx_id)
             existing_transaction = conn.execute(
                 "SELECT transaction_id FROM transactions WHERE transaction_id = ?",
                 (tx_id,),
             ).fetchone()
+            can_persist_identification = (
+                not existing_transaction or update_existing
+            )
+            identification_write_allowed.append(can_persist_identification)
             if existing_transaction and not update_existing:
                 transactions_skipped += 1
                 continue
@@ -437,24 +774,29 @@ def persist_upload(
             bond_identity = (
                 deal.get("bond_identity")
                 or deal.get("bond_identity_text")
-                or "UNKNOWN"
-            ).strip()
+                or ""
+            ).strip() or None
             isin = (
                 deal.get("isin") or deal.get("isin_text") or ""
             ).strip().upper() or None
-            identity_type = deal.get("identity_type") or ("ISIN" if isin else "NAME_ONLY")
+            identity_type = deal.get("identity_type") or (
+                "ISIN" if isin else ("NAME_ONLY" if bond_identity else "UNKNOWN")
+            )
             if identity_type not in ('ISIN', 'CUSIP', 'SERIES', 'NAME_ONLY', 'UNKNOWN'):
                 identity_type = "UNKNOWN"
 
-            # Check if bond already exists
             existing_bond = None
-            if isin:
+            if not defer_bond_creation and isin:
                 cur = conn.execute("SELECT bond_id FROM bonds WHERE isin = ?", (isin,))
                 row = cur.fetchone()
                 if row:
                     existing_bond = row["bond_id"]
 
-            if not existing_bond and bond_identity:
+            if (
+                not defer_bond_creation
+                and not existing_bond
+                and bond_identity
+            ):
                 cur = conn.execute("SELECT bond_id FROM bonds WHERE bond_identity = ?", (bond_identity,))
                 row = cur.fetchone()
                 if row:
@@ -462,7 +804,9 @@ def persist_upload(
 
             if existing_bond:
                 bond_id = existing_bond
-            else:
+            elif defer_bond_creation:
+                bond_id = None
+            elif bond_identity:
                 bond_id = str(uuid.uuid4())
                 conn.execute(
                     """
@@ -486,6 +830,8 @@ def persist_upload(
                     ),
                 )
                 bonds_stored += 1
+            else:
+                bond_id = None
 
             # Transaction identity is based on this upload and its context position.
             normalized_quantity = deal.get("normalized_quantity")
@@ -624,6 +970,8 @@ def persist_upload(
                         "needs_review",
                     }
                 ]
+                if defer_bond_creation:
+                    update_columns.remove("bond_id")
                 conn.execute(
                     "UPDATE transactions SET "
                     + ", ".join(f"{column} = ?" for column in update_columns)
@@ -682,6 +1030,27 @@ def persist_upload(
                 [(tx_id, message_id) for message_id in linked_message_ids],
             )
 
+        if identification_results is not None:
+            for transaction_id, result, can_persist in zip(
+                transaction_ids,
+                identification_results,
+                identification_write_allowed,
+            ):
+                if can_persist:
+                    persist_identification_result(
+                        db_path,
+                        transaction_id,
+                        result,
+                        conn=conn,
+                    )
+                else:
+                    identification_skipped += 1
+
+        identification_by_status = (
+            _identification_status_counts(conn, transaction_ids)
+            if identification_results is not None
+            else {}
+        )
         conn.commit()
         return {
             "already_stored": False,
@@ -697,6 +1066,9 @@ def persist_upload(
             "transactions_updated": transactions_updated,
             "transactions_skipped": transactions_skipped,
             "transactions_stored": transactions_stored + transactions_updated,
+            "transaction_ids": transaction_ids,
+            "identification_by_status": identification_by_status,
+            "identification_skipped": identification_skipped,
         }
 
     except Exception:
@@ -704,6 +1076,344 @@ def persist_upload(
         raise
     finally:
         conn.close()
+
+
+def _reference_record_payload(record: Any) -> Dict[str, Any]:
+    return {
+        "normalized_isin": record.normalized_isin,
+        "normalized_issuer_key": record.normalized_issuer_key,
+        "maturity_date": (
+            record.maturity_date.isoformat()
+            if record.maturity_date is not None
+            else None
+        ),
+        "source_values": dict(record.source_values),
+    }
+
+
+def _match_evidence_payload(result: BondMatchResult) -> Dict[str, Any]:
+    return {
+        "source_evidence": [
+            dict(vars(evidence)) for evidence in result.source_evidence
+        ],
+        "isin_source_evidence": [
+            dict(vars(evidence)) for evidence in result.isin_source_evidence
+        ],
+    }
+
+
+def _link_authorized_by_evidence(
+    result: BondMatchResult,
+    reference: Any,
+) -> bool:
+    if result.status == BondMatchStatus.PRIMARY_ISIN_MATCH:
+        return (
+            result.matching_method == "primary_isin"
+            and result.isin_status == IsinStatus.VALID_ISIN
+            and result.normalized_isin == reference.normalized_isin
+            and bool(result.isin_source_evidence)
+            and all(
+                evidence.start >= 0
+                and evidence.end > evidence.start
+                and evidence.end <= len(evidence.source_message_text)
+                and evidence.source_message_text[evidence.start:evidence.end]
+                == evidence.matched_text
+                and normalize_isin_candidate(evidence.matched_text)
+                == reference.normalized_isin
+                and (
+                    (
+                        evidence.relationship == "direct_message"
+                        and evidence.message_id
+                        and evidence.linked_to_message_id is None
+                    )
+                    or (
+                        evidence.relationship == "linked_message"
+                        and evidence.linked_to_message_id
+                        and bool(evidence.link_evidence)
+                    )
+                )
+                for evidence in result.isin_source_evidence
+            )
+        )
+    if result.status == BondMatchStatus.SECONDARY_ISSUER_MATCH:
+        return (
+            result.matching_method == "secondary_issuer"
+            and bool(result.raw_issuer_text and result.raw_issuer_text.strip())
+            and bool(result.source_evidence)
+            and any(
+                evidence.field_name == "issuer"
+                and evidence.start >= 0
+                and evidence.end > evidence.start
+                and evidence.end <= len(evidence.source_message_text)
+                and normalize_issuer_key(evidence.source_value)
+                == normalize_issuer_key(result.raw_issuer_text)
+                and (
+                    (
+                        evidence.linked_to_message_id is None
+                        and bool(evidence.message_id)
+                        and evidence.link_evidence is None
+                    )
+                    or (
+                        bool(evidence.linked_to_message_id)
+                        and bool(evidence.link_evidence)
+                    )
+                )
+                for evidence in result.source_evidence
+            )
+        )
+    return False
+
+
+def _json_default(value: Any) -> Any:
+    if hasattr(value, "value"):
+        return value.value
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    raise TypeError(f"Value of type {type(value).__name__} is not JSON serializable.")
+
+
+def _insert_identification_audit(
+    conn: sqlite3.Connection,
+    audit_values: Tuple[Any, ...],
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT OR IGNORE INTO identification_audit (
+            audit_id, transaction_id, identification_status, matching_method,
+            reason, normalized_isin, raw_issuer_text, normalized_issuer_key,
+            evidence_json, candidates_json, decision_key, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        audit_values,
+    )
+    return cursor.rowcount
+
+
+def persist_identification_result(
+    db_path: str,
+    transaction_id: str,
+    result: BondMatchResult,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    """Persist one Phase 4 decision atomically without inventing a bond."""
+    if not isinstance(result, BondMatchResult):
+        raise TypeError("result must be a BondMatchResult.")
+
+    authorized_statuses = {
+        BondMatchStatus.PRIMARY_ISIN_MATCH,
+        BondMatchStatus.SECONDARY_ISSUER_MATCH,
+    }
+    authorized = result.status in authorized_statuses
+    matched_reference = result.matched_reference
+    if authorized and matched_reference is None:
+        raise ValueError(
+            "A uniquely matched result must include its matched reference record."
+        )
+    if authorized and not _link_authorized_by_evidence(result, matched_reference):
+        raise ValueError(
+            "The unique-match status is not supported by the required source evidence."
+        )
+
+    evidence_json = json.dumps(
+        _match_evidence_payload(result),
+        ensure_ascii=False,
+        sort_keys=True,
+        default=_json_default,
+    )
+    candidates_json = json.dumps(
+        [_reference_record_payload(record) for record in result.candidate_references],
+        ensure_ascii=False,
+        sort_keys=True,
+        default=_json_default,
+    )
+    decision_payload = {
+        "status": result.status.value,
+        "matching_method": result.matching_method,
+        "reason": result.explanation,
+        "normalized_isin": result.normalized_isin,
+        "raw_issuer_text": result.raw_issuer_text,
+        "normalized_issuer_key": result.normalized_issuer_key,
+        "evidence": json.loads(evidence_json),
+        "candidates": json.loads(candidates_json),
+        "matched_reference": (
+            _reference_record_payload(matched_reference)
+            if matched_reference is not None
+            else None
+        ),
+    }
+    decision_key = hashlib.sha256(
+        json.dumps(
+            decision_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=_json_default,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    owns_connection = conn is None
+    connection = conn if conn is not None else get_db_connection(db_path)
+    try:
+        if owns_connection:
+            connection.execute("BEGIN IMMEDIATE")
+        elif not connection.in_transaction:
+            raise RuntimeError(
+                "A caller-owned connection must already be in a transaction."
+            )
+        transaction = connection.execute(
+            """
+            SELECT bond_id, identification_status
+            FROM transactions
+            WHERE transaction_id = ?
+            """,
+            (transaction_id,),
+        ).fetchone()
+        if transaction is None:
+            raise ValueError(f"Transaction {transaction_id!r} does not exist.")
+
+        current_bond_id = transaction["bond_id"]
+        previous_status = transaction["identification_status"]
+        target_bond_id = current_bond_id
+        if authorized:
+            normalized_isin = matched_reference.normalized_isin
+            if not normalized_isin:
+                raise ValueError(
+                    "A uniquely matched reference must have a normalized ISIN."
+                )
+            bond = connection.execute(
+                "SELECT bond_id FROM bonds WHERE isin = ?",
+                (normalized_isin,),
+            ).fetchone()
+            if bond is None:
+                source_values = dict(matched_reference.source_values)
+                issuer = source_values.get("NAME_OF_ISSUER", "").strip()
+                description = source_values.get("SECURITY_DESCRIPTION", "").strip()
+                maturity = matched_reference.maturity_date
+                rate_text = source_values.get("INTEREST_RATE", "").strip()
+                if rate_text:
+                    try:
+                        coupon_rate = float(rate_text.removesuffix("%").strip())
+                    except ValueError as error:
+                        raise ValueError(
+                            "The matched reference has an invalid interest rate."
+                        ) from error
+                else:
+                    coupon_rate = None
+                target_bond_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO bonds (
+                        bond_id, isin, bond_identity, identity_type, issuer_name,
+                        maturity_date, coupon_rate, currency
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        target_bond_id,
+                        normalized_isin,
+                        issuer or description or normalized_isin,
+                        "ISIN",
+                        issuer or None,
+                        maturity.isoformat() if maturity is not None else None,
+                        coupon_rate,
+                        source_values.get("CURRENCY") or None,
+                    ),
+                )
+            else:
+                target_bond_id = bond["bond_id"]
+
+            if current_bond_id and current_bond_id != target_bond_id:
+                if previous_status in {
+                    BondMatchStatus.PRIMARY_ISIN_MATCH.value,
+                    BondMatchStatus.SECONDARY_ISSUER_MATCH.value,
+                }:
+                    raise ValueError(
+                        "The transaction already has an identified bond link; "
+                        "a different result requires manual review."
+                    )
+                current_bond = connection.execute(
+                    """
+                    SELECT isin, identity_type
+                    FROM bonds
+                    WHERE bond_id = ?
+                    """,
+                    (current_bond_id,),
+                ).fetchone()
+                is_unresolved_link = (
+                    current_bond is not None
+                    and current_bond["isin"] is None
+                    and current_bond["identity_type"] in {"UNKNOWN", "NAME_ONLY"}
+                )
+                if not is_unresolved_link:
+                    raise ValueError(
+                        "The transaction already has a different bond link; "
+                        "the identification result was not applied."
+                    )
+        elif current_bond_id:
+            if previous_status in {
+                BondMatchStatus.PRIMARY_ISIN_MATCH.value,
+                BondMatchStatus.SECONDARY_ISSUER_MATCH.value,
+            }:
+                raise ValueError(
+                    "The transaction already has an identified bond link; "
+                    "an unresolved result cannot remove it."
+                )
+            current_bond = connection.execute(
+                "SELECT isin, identity_type FROM bonds WHERE bond_id = ?",
+                (current_bond_id,),
+            ).fetchone()
+            if (
+                current_bond is not None
+                and current_bond["isin"] is None
+                and current_bond["identity_type"] in {"UNKNOWN", "NAME_ONLY"}
+            ):
+                target_bond_id = None
+            else:
+                raise ValueError(
+                    "The transaction has an existing bond link; an unresolved "
+                    "result cannot remove it automatically."
+                )
+
+        connection.execute(
+            """
+            UPDATE transactions
+            SET bond_id = ?, identification_status = ?
+            WHERE transaction_id = ?
+            """,
+            (target_bond_id, result.status.value, transaction_id),
+        )
+        audit_inserted = _insert_identification_audit(
+            connection,
+            (
+                str(uuid.uuid4()),
+                transaction_id,
+                result.status.value,
+                result.matching_method,
+                result.explanation,
+                result.normalized_isin,
+                result.raw_issuer_text,
+                result.normalized_issuer_key,
+                evidence_json,
+                candidates_json,
+                decision_key,
+                datetime.now().isoformat(),
+            ),
+        )
+        if owns_connection:
+            connection.commit()
+        return {
+            "transaction_id": transaction_id,
+            "identification_status": result.status.value,
+            "bond_id": target_bond_id,
+            "bond_linked": bool(authorized),
+            "audit_inserted": bool(audit_inserted),
+        }
+    except Exception:
+        if owns_connection:
+            connection.rollback()
+        raise
+    finally:
+        if owns_connection:
+            connection.close()
 
 
 def fetch_database_data(db_path: str = DB_PATH) -> Dict[str, Any]:
@@ -731,6 +1441,18 @@ def fetch_database_data(db_path: str = DB_PATH) -> Dict[str, Any]:
             linked_message_ids.setdefault(row["transaction_id"], []).append(
                 row["message_id"]
             )
+        linked_transaction_rows = conn.execute(
+            """
+            SELECT message_id, transaction_id
+            FROM transaction_messages
+            ORDER BY message_id, transaction_id
+            """
+        ).fetchall()
+        linked_transaction_ids: Dict[str, List[str]] = {}
+        for row in linked_transaction_rows:
+            linked_transaction_ids.setdefault(row["message_id"], []).append(
+                row["transaction_id"]
+            )
         transactions = []
         for row in tx_rows:
             transaction = dict(row)
@@ -757,11 +1479,19 @@ def fetch_database_data(db_path: str = DB_PATH) -> Dict[str, Any]:
 
         bonds_rows = conn.execute("SELECT * FROM bonds ORDER BY bond_identity ASC").fetchall()
         msgs_rows = conn.execute("SELECT * FROM messages ORDER BY timestamp ASC LIMIT 500").fetchall()
+        messages = []
+        for row in msgs_rows:
+            message = dict(row)
+            message["transaction_ids"] = linked_transaction_ids.get(
+                message["message_id"],
+                [],
+            )
+            messages.append(message)
 
         return {
             "transactions": transactions,
             "bonds": [dict(r) for r in bonds_rows],
-            "messages": [dict(r) for r in msgs_rows],
+            "messages": messages,
             "counts": {
                 "transactions": len(tx_rows),
                 "bonds": len(bonds_rows),

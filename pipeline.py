@@ -10,6 +10,7 @@ Handles:
 """
 
 import json
+import logging
 import re
 import unicodedata
 import uuid
@@ -25,6 +26,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 import config
 import privacy
+from bond_matching import BondMatchResult
+from bond_reference import BondReferenceIndex
 from normalize import (
     is_valid_isin,
     normalize_maturity,
@@ -34,6 +37,7 @@ from normalize import (
 )
 
 MODEL_NAME = config.MODEL_NAME
+logger = logging.getLogger(__name__)
 ISSUER_ALIASES_PATH = Path(__file__).with_name("issuer_aliases.json")
 with ISSUER_ALIASES_PATH.open(encoding="utf-8") as aliases_file:
     ISSUER_ALIASES = json.load(aliases_file)
@@ -1212,8 +1216,10 @@ def get_model_context_length(model: str = MODEL_NAME) -> int:
             ctx_match = re.search(r"num_ctx\s+(\d+)", show_res.parameters)
             if ctx_match:
                 return int(ctx_match.group(1))
-    except Exception as e:
-        print(f"Notice: Could not fetch context length via client.show({model}): {e}")
+    except Exception:
+        logger.warning(
+            "Could not fetch model context length; using the configured fallback."
+        )
 
     # Default fallback for gemma4:31b-cloud
     return config.MODEL_CONTEXT_LENGTH_FALLBACK
@@ -1236,8 +1242,8 @@ def call_llm_extraction(
         "total_tokens": 0,
         "attempts": 0,
     }
-    last_raw_text = ""
-    last_error = ""
+    correlation_id = str(uuid.uuid4())
+    error_category = "model_extraction_failed"
 
     for attempt in range(config.LLM_RETRIES + 1):
         token_metrics["attempts"] += 1
@@ -1270,20 +1276,28 @@ def call_llm_extraction(
             result = validated.model_dump(mode="json")
             result["prompt_version"] = PROMPT_VERSION
             return result, token_metrics
-        except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as error:
-            last_error = str(error)
-        except Exception as error:
-            last_error = str(error)
-            if not last_raw_text:
-                last_raw_text = str(error)
+        except (json.JSONDecodeError, ValidationError, TypeError, ValueError):
+            error_category = "invalid_model_response"
+        except Exception:
+            error_category = "provider_error"
 
         if attempt < config.LLM_RETRIES:
-            prompt = _extraction_prompt(context_snippet, last_error)
+            retry_guidance = (
+                "The previous response failed schema/JSON validation."
+                if error_category == "invalid_model_response"
+                else "The previous inference attempt failed; retry the extraction."
+            )
+            prompt = _extraction_prompt(
+                context_snippet,
+                retry_guidance,
+            )
 
     return {
         "extraction_failed": True,
-        "raw_text": last_raw_text,
-        "error": last_error,
+        "raw_text": None,
+        "error": "Model extraction failed. Retry or check the model service.",
+        "error_category": error_category,
+        "correlation_id": correlation_id,
         "prompt_version": PROMPT_VERSION,
     }, token_metrics
 
@@ -1334,6 +1348,33 @@ def _same_number(left: str, right: str) -> bool:
         return left == right
 
 
+def _has_explicit_price_label(value: Any, lines: List[str]) -> bool:
+    wanted_numbers = _number_tokens(str(value))
+    if len(wanted_numbers) != 1:
+        return False
+    price_expression = re.compile(
+        r"\b(?:clean\s+)?price\b\s*"
+        r"(?:(?:is|at|of)\s+|[:=@-]\s*)?"
+        r"(?P<number>\d+(?:[.,]\d+)?)"
+        r"(?![\d.,]|\s*%)",
+        re.IGNORECASE,
+    )
+    for line in lines:
+        normalized = unicodedata.normalize(
+            "NFKC",
+            _evidence_body(line),
+        ).translate(_EVIDENCE_DIGITS)
+        if any(
+            _same_number(
+                wanted_numbers[0],
+                match.group("number").replace(",", ""),
+            )
+            for match in price_expression.finditer(normalized)
+        ):
+            return True
+    return False
+
+
 def _numbered_lines(context_snippet: Optional[str]) -> Dict[str, str]:
     """Map '#n' to the full message text, including indented continuation lines.
     Quoted 'replying to:' lines are excluded: they belong to another message."""
@@ -1379,7 +1420,9 @@ def _value_appears_in_lines(field: str, value: Any, lines: List[str]) -> bool:
     bodies = [_evidence_body(line) for line in lines]
     if field == "isin_text":
         return any(str(value) in line for line in bodies)
-    if field in {"ytm", "quantity_text", "coupon_rate", "price"}:
+    if field == "price":
+        return _has_explicit_price_label(value, bodies)
+    if field in {"ytm", "quantity_text", "coupon_rate"}:
         wanted_numbers = _number_tokens(str(value))
         if not wanted_numbers:
             return False
@@ -2025,3 +2068,22 @@ def validate_extraction(
         or validated.get("settlement_needs_review", False)
     )
     return validated
+
+
+def identify_extracted_bond(
+    deal: Dict[str, Any],
+    parsed_messages: List[Dict[str, Any]],
+    message_number_map: Dict[str, str],
+    reference_index: Optional[BondReferenceIndex],
+    reference_error: Optional[str] = None,
+) -> BondMatchResult:
+    """Apply source-based ISIN validation and conservative reference matching."""
+    from bond_identification import identify_extracted_deal
+
+    return identify_extracted_deal(
+        deal,
+        parsed_messages,
+        message_number_map,
+        reference_index,
+        reference_error,
+    )
