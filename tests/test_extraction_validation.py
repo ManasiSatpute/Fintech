@@ -93,6 +93,19 @@ class EvidenceValidationTests(unittest.TestCase):
                 self.assertEqual(result["buyer_text"], "Desk")
                 self.assertIsNone(result["seller_text"])
 
+    def test_offer_request_corrects_an_inconsistent_model_side(self):
+        result = self.validate_direction(
+            "offer pls",
+            "SELL",
+            "Desk",
+            None,
+        )
+
+        self.assertEqual(result["owner_side"], "BUY")
+        self.assertEqual(result["buyer_text"], "Desk")
+        self.assertIn("side_corrected", result["warnings"])
+        self.assertNotIn("unsupported_owner_side", result["warnings"])
+
     def test_level_bearing_offers_mean_sender_is_selling(self):
         for phrase in (
             "offer at 10.08",
@@ -122,6 +135,18 @@ class EvidenceValidationTests(unittest.TestCase):
                 self.assertEqual(result["owner_side"], "SELL")
                 self.assertIsNone(result["buyer_text"])
                 self.assertEqual(result["seller_text"], "Desk")
+
+    def test_bid_request_corrects_an_inconsistent_model_side(self):
+        result = self.validate_direction(
+            "bid pls",
+            "BUY",
+            None,
+            None,
+        )
+
+        self.assertEqual(result["owner_side"], "SELL")
+        self.assertIn("side_corrected", result["warnings"])
+        self.assertNotIn("unsupported_owner_side", result["warnings"])
 
     def test_level_bearing_bids_mean_sender_is_buying(self):
         for phrase in ("bid at 10.08", "I have a bid"):
@@ -165,6 +190,36 @@ class EvidenceValidationTests(unittest.TestCase):
         self.assertEqual(result["owner_side"], "UNKNOWN")
         self.assertIsNone(result["buyer_text"])
         self.assertIsNone(result["seller_text"])
+
+    def test_isin_units_without_side_clears_model_party_values(self):
+        result = pipeline.validate_extraction(
+            {
+                "isin_text": "US0378331005",
+                "quantity_text": "158 units",
+                "owner_side": "BUY",
+                "buyer_text": "Desk",
+                "seller_text": "Trader B",
+                "evidence": {
+                    "isin_text": ["#1"],
+                    "quantity_text": ["#1"],
+                    "owner_side": ["#1"],
+                    "buyer_text": ["#1"],
+                    "seller_text": ["#1"],
+                },
+            },
+            (
+                "Chat: Synthetic Desk\n"
+                "Type: PRIVATE\n"
+                "Date: 2026-10-20\n"
+                "#1 [10:00:00] [OWN] Desk: "
+                "US0378331005 158 units"
+            ),
+        )
+
+        self.assertEqual(result["owner_side"], "UNKNOWN")
+        self.assertIsNone(result["buyer_text"])
+        self.assertIsNone(result["seller_text"])
+        self.assertIn("side_corrected", result["warnings"])
 
     def test_missing_status_defaults_to_uncertain_with_warning(self):
         deal = concluded_deal()

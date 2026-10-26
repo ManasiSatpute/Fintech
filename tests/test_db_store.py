@@ -170,6 +170,16 @@ class DatabaseStoreTests(unittest.TestCase):
         self.assertEqual(transaction["needs_review"], 1)
         self.assertEqual(transaction["confidence"], 0.85)
 
+    def test_non_numeric_ytm_text_survives_storage_and_data_formatting(self):
+        deal = self.deals()[0]
+        deal["ytm"] = "8.33-32"
+        self.persist([deal])
+
+        transaction = db.fetch_database_data(self.db_path)["transactions"][0]
+
+        self.assertEqual(transaction["ytm"], "8.33-32")
+        self.assertEqual(transaction["ytm_display"], "8.33-32")
+
     def test_missing_settlement_stores_null_not_t1(self):
         deal = self.deals()[0]
         self.persist([deal])

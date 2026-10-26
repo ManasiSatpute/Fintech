@@ -29,3 +29,6 @@ Whatsaapp_to_Sql*
 .DS_Store
 .github/
 AGENTS.md
+
+# CSV Files
+ISIN_DETAILS.csv

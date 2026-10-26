@@ -1620,6 +1620,86 @@ def _evidence_check(
     return verified, warnings, cited_lines
 
 
+def _correct_owner_side_from_cited_lines(
+    deal: Dict[str, Any],
+    context_snippet: Optional[str],
+    warnings: List[str],
+) -> None:
+    evidence = deal.get("evidence")
+    if not isinstance(evidence, dict):
+        return
+    numbered_lines = _numbered_lines(context_snippet)
+    citations = {
+        citation
+        for field_citations in evidence.values()
+        if isinstance(field_citations, list)
+        for citation in field_citations
+        if isinstance(citation, str)
+    }
+    cited_lines = [
+        line for citation, line in numbered_lines.items() if citation in citations
+    ]
+    if not cited_lines:
+        return
+
+    owner_lines = [
+        _evidence_body(line)
+        for line in cited_lines
+        if re.match(r"^\s*\[OWN\](?:\s|$)", _evidence_body(line), re.IGNORECASE)
+    ]
+    bodies = [_evidence_body(line) for line in cited_lines]
+    has_offer_level = any(
+        re.search(
+            r"\b(?:"
+            r"\d+(?:[.,]\d+)?\s*%?\s*offers?"
+            r"|offers?\s*(?:pls|please)?\s*(?:at|@)\s*\d"
+            r")",
+            body,
+            re.IGNORECASE,
+        )
+        for body in bodies
+    )
+    correction: Optional[str] = None
+    if owner_lines and not has_offer_level and any(
+        _contains_lexicon_entry(line, "buyer_request_cues")
+        for line in owner_lines
+    ):
+        correction = "BUY"
+    elif owner_lines and any(
+        _contains_lexicon_entry(line, "seller_request_cues")
+        for line in owner_lines
+    ):
+        correction = "SELL"
+
+    has_isin_with_units = any(
+        re.search(r"\b[A-Z]{2}[A-Z0-9]{10}\b", body, re.IGNORECASE)
+        and (
+            re.search(r"\b\d+\s*(?:units?|pieces?|pcs?)\b", body, re.IGNORECASE)
+            or re.search(
+                r"\b[A-Z]{2}[A-Z0-9]{10}\s*[-–]\s*\d+\b",
+                body,
+                re.IGNORECASE,
+            )
+        )
+        for body in bodies
+    )
+    has_side_cue = any(_speaker_trade_side(body) is not None for body in bodies)
+    if correction is not None:
+        deal["owner_side"] = correction
+    elif has_isin_with_units and not has_side_cue:
+        correction = "UNKNOWN"
+        deal["owner_side"] = correction
+        deal["buyer_text"] = None
+        deal["seller_text"] = None
+
+    if correction is not None:
+        warnings[:] = [
+            warning for warning in warnings if warning != "unsupported_owner_side"
+        ]
+        if "side_corrected" not in warnings:
+            warnings.append("side_corrected")
+
+
 def _settlement_reference_datetime(
     context_snippet: Optional[str],
     settlement_citations: List[str],
@@ -1871,6 +1951,7 @@ def validate_extraction(
         context_snippet,
     )
     warnings.extend(evidence_warnings)
+    _correct_owner_side_from_cited_lines(validated, context_snippet, warnings)
     if validated.get("status") not in EXTRACTION_STATUSES:
         validated["status"] = "UNCERTAIN"
         if "status_missing_defaulted" not in warnings:

@@ -9,6 +9,7 @@ Connects the Chat-style UI to the Python backend with:
 - /load-sample/{filename}
 """
 
+import hashlib
 import os
 import time
 import uuid
@@ -97,6 +98,7 @@ async def upload_file(file: UploadFile = File(...)):
     _store_upload_session(upload_id, {
         "upload_id": upload_id,
         "filename": filename,
+        "source_hash": hashlib.sha256(content_bytes).hexdigest(),
         "raw_text": raw_text,
         "parsed_messages": parsed_messages,
         "parse_report": parse_report,
@@ -332,7 +334,7 @@ async def extract_trades(upload_id: str):
 
 
 @app.post("/store/{upload_id}")
-async def store_extracted_data(upload_id: str):
+async def store_extracted_data(upload_id: str, update_existing: bool = False):
     """
     Step 8 & 9: Persist parsed messages, distinct bonds, and transactions
     into SQLite database in a single atomic transaction.
@@ -353,19 +355,52 @@ async def store_extracted_data(upload_id: str):
             context_message_maps=session.get("context_message_maps", {}),
             prompt_version=session.get("prompt_version"),
             model_name=session.get("model_name"),
+            source_hash=session.get("source_hash"),
+            update_existing=update_existing,
         )
 
+        messages_inserted = counts.get(
+            "messages_inserted",
+            counts.get("messages_stored", 0),
+        )
+        messages_already_present = counts.get("messages_already_present", 0)
+        transactions_inserted = counts.get(
+            "transactions_inserted",
+            counts.get("transactions_stored", 0),
+        )
+        transactions_updated = counts.get("transactions_updated", 0)
+        transactions_skipped = counts.get("transactions_skipped", 0)
+        already_stored = counts.get("already_stored", False)
+        if already_stored:
+            message = (
+                "This file was already stored; no records were changed. "
+                f"{messages_already_present} messages already present "
+                f"and {transactions_skipped} transactions skipped."
+            )
+        else:
+            message = (
+                f"Stored successfully — {messages_inserted} messages "
+                f"inserted, {messages_already_present} already present, "
+                f"{transactions_inserted} transactions inserted, "
+                f"{transactions_updated} updated, and "
+                f"{transactions_skipped} skipped."
+            )
         return {
             "success": True,
             "upload_id": upload_id,
-            "messages_stored": counts["messages_stored"],
-            "bonds_stored": counts["bonds_stored"],
-            "transactions_stored": counts["transactions_stored"],
-            "message": (
-                f"Stored successfully — {counts['messages_stored']} messages, "
-                f"{counts['bonds_stored']} bonds, {counts['transactions_stored']} "
-                f"transactions saved to the database."
+            "already_stored": already_stored,
+            "messages_inserted": messages_inserted,
+            "messages_already_present": messages_already_present,
+            "transactions_inserted": transactions_inserted,
+            "transactions_updated": transactions_updated,
+            "transactions_skipped": transactions_skipped,
+            "messages_stored": counts.get("messages_stored", messages_inserted),
+            "bonds_stored": counts.get("bonds_stored", 0),
+            "transactions_stored": counts.get(
+                "transactions_stored",
+                transactions_inserted + transactions_updated,
             ),
+            "message": message,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database storage failed: {e}")
@@ -420,8 +455,9 @@ def load_sample_file(filename: str):
     if not found_path:
         raise HTTPException(status_code=404, detail=f"Sample file {safe_name} not found.")
 
-    with open(found_path, "r", encoding="utf-8", errors="replace") as f:
-        raw_text = f.read()
+    with open(found_path, "rb") as f:
+        content_bytes = f.read()
+    raw_text = content_bytes.decode("utf-8", errors="replace")
 
     upload_id = str(uuid.uuid4())
     parsed_messages, parse_report = pipeline.parse_raw_chat_content(
@@ -433,6 +469,7 @@ def load_sample_file(filename: str):
     _store_upload_session(upload_id, {
         "upload_id": upload_id,
         "filename": safe_name,
+        "source_hash": hashlib.sha256(content_bytes).hexdigest(),
         "raw_text": raw_text,
         "parsed_messages": parsed_messages,
         "parse_report": parse_report,
