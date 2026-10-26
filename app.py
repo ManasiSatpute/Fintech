@@ -34,6 +34,13 @@ from bond_identification import identification_summary
 app = FastAPI(title="Bond Trade Extraction App", version="1.0.0")
 logger = logging.getLogger(__name__)
 
+
+class _ContextExtractionFailure(RuntimeError):
+    def __init__(self, error_category: str, correlation_id: str) -> None:
+        super().__init__("Context extraction failed.")
+        self.error_category = error_category
+        self.correlation_id = correlation_id
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.ALLOWED_ORIGINS,
@@ -176,8 +183,13 @@ async def extract_trades(upload_id: str):
     if selected_contexts:
         try:
             reference_index = get_bond_reference_index()
-        except BondReferenceError as error:
-            reference_error = str(error)
+        except BondReferenceError:
+            logger.error(
+                "Bond reference data is unavailable; check BOND_REFERENCE_CSV."
+            )
+            reference_error = (
+                "Bond reference data is unavailable. Check BOND_REFERENCE_CSV."
+            )
 
     for ctx in selected_contexts:
         extraction_result: Dict[str, Any] = {}
@@ -199,8 +211,11 @@ async def extract_trades(upload_id: str):
             max_single_call_tokens = max(max_single_call_tokens, tot_tk)
 
             if extraction_result.get("extraction_failed"):
-                raise RuntimeError(
-                    str(extraction_result.get("error") or "Extraction failed")
+                raise _ContextExtractionFailure(
+                    error_category=extraction_result.get("error_category")
+                    or "model_extraction_failed",
+                    correlation_id=extraction_result.get("correlation_id")
+                    or str(uuid.uuid4()),
                 )
 
             context_datetime = max(
@@ -219,6 +234,13 @@ async def extract_trades(upload_id: str):
                     context_snippet=ctx["snippet_text"],
                     message_datetime=context_datetime,
                 )
+                if validated_deal.get("extraction_failed"):
+                    validated_deal.pop("raw_text", None)
+                    validated_deal["error"] = (
+                        "A model deal could not be validated."
+                    )
+                    validated_deal["error_category"] = "invalid_extracted_deal"
+                    validated_deal["correlation_id"] = str(uuid.uuid4())
                 validated_deal = privacy.restore_pii(
                     validated_deal,
                     ctx.get("privacy_map", {}),
@@ -250,21 +272,29 @@ async def extract_trades(upload_id: str):
                 identification_results.append(match_result)
                 extractions.append(validated_deal)
             processed_contexts += 1
-        except Exception:
-            logger.exception("Context extraction failed")
+        except Exception as error:
+            error_category = (
+                error.error_category
+                if isinstance(error, _ContextExtractionFailure)
+                else "context_processing_failed"
+            )
+            correlation_id = (
+                error.correlation_id
+                if isinstance(error, _ContextExtractionFailure)
+                else str(uuid.uuid4())
+            )
+            logger.warning(
+                "Context extraction failed: category=%s correlation_id=%s",
+                error_category,
+                correlation_id,
+            )
             failed_contexts += 1
-            raw_output = extraction_result.get(
-                "raw_text",
-                extraction_result.get("raw_output"),
-            )
-            raw_output = privacy.restore_pii(
-                raw_output,
-                ctx.get("privacy_map", {}),
-            )
             context_error = {
                 "context_id": ctx["context_id"],
                 "error": "Extraction failed for this context.",
-                "raw_llm_output": raw_output,
+                "error_category": error_category,
+                "correlation_id": correlation_id,
+                "raw_llm_output": None,
                 "call_tokens": tokens,
                 "chat_key": ctx["chat_key"],
                 "chat_name": ctx["chat_name"],

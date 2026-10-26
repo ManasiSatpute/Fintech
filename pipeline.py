@@ -10,6 +10,7 @@ Handles:
 """
 
 import json
+import logging
 import re
 import unicodedata
 import uuid
@@ -36,6 +37,7 @@ from normalize import (
 )
 
 MODEL_NAME = config.MODEL_NAME
+logger = logging.getLogger(__name__)
 ISSUER_ALIASES_PATH = Path(__file__).with_name("issuer_aliases.json")
 with ISSUER_ALIASES_PATH.open(encoding="utf-8") as aliases_file:
     ISSUER_ALIASES = json.load(aliases_file)
@@ -1214,8 +1216,10 @@ def get_model_context_length(model: str = MODEL_NAME) -> int:
             ctx_match = re.search(r"num_ctx\s+(\d+)", show_res.parameters)
             if ctx_match:
                 return int(ctx_match.group(1))
-    except Exception as e:
-        print(f"Notice: Could not fetch context length via client.show({model}): {e}")
+    except Exception:
+        logger.warning(
+            "Could not fetch model context length; using the configured fallback."
+        )
 
     # Default fallback for gemma4:31b-cloud
     return config.MODEL_CONTEXT_LENGTH_FALLBACK
@@ -1238,8 +1242,8 @@ def call_llm_extraction(
         "total_tokens": 0,
         "attempts": 0,
     }
-    last_raw_text = ""
-    last_error = ""
+    correlation_id = str(uuid.uuid4())
+    error_category = "model_extraction_failed"
 
     for attempt in range(config.LLM_RETRIES + 1):
         token_metrics["attempts"] += 1
@@ -1272,20 +1276,28 @@ def call_llm_extraction(
             result = validated.model_dump(mode="json")
             result["prompt_version"] = PROMPT_VERSION
             return result, token_metrics
-        except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as error:
-            last_error = str(error)
-        except Exception as error:
-            last_error = str(error)
-            if not last_raw_text:
-                last_raw_text = str(error)
+        except (json.JSONDecodeError, ValidationError, TypeError, ValueError):
+            error_category = "invalid_model_response"
+        except Exception:
+            error_category = "provider_error"
 
         if attempt < config.LLM_RETRIES:
-            prompt = _extraction_prompt(context_snippet, last_error)
+            retry_guidance = (
+                "The previous response failed schema/JSON validation."
+                if error_category == "invalid_model_response"
+                else "The previous inference attempt failed; retry the extraction."
+            )
+            prompt = _extraction_prompt(
+                context_snippet,
+                retry_guidance,
+            )
 
     return {
         "extraction_failed": True,
-        "raw_text": last_raw_text,
-        "error": last_error,
+        "raw_text": None,
+        "error": "Model extraction failed. Retry or check the model service.",
+        "error_category": error_category,
+        "correlation_id": correlation_id,
         "prompt_version": PROMPT_VERSION,
     }, token_metrics
 

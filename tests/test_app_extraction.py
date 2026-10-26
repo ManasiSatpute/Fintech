@@ -85,6 +85,8 @@ class AppExtractionTests(unittest.IsolatedAsyncioTestCase):
                     "extraction_failed": True,
                     "raw_text": "synthetic raw response",
                     "error": "invalid response",
+                    "error_category": "invalid_model_response",
+                    "correlation_id": "synthetic-correlation-id",
                     "prompt_version": "test",
                 },
                 {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
@@ -132,8 +134,13 @@ class AppExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["needs_review_count"], 1)
         self.assertEqual(
             report["context_errors"][0]["raw_llm_output"],
-            "synthetic raw response",
+            None,
         )
+        self.assertEqual(
+            report["context_errors"][0]["error_category"],
+            "invalid_model_response",
+        )
+        self.assertTrue(report["context_errors"][0]["correlation_id"])
         deal = report["extractions"][1]
         self.assertEqual(deal["chat_key"], "CHAT:test")
         self.assertEqual(deal["chat_name"], "Synthetic")

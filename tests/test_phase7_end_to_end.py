@@ -13,7 +13,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 
 import app
 import db
-from bond_reference import BondReferenceIndex
+from bond_reference import BondReferenceError, BondReferenceIndex
 
 
 REFERENCE_COLUMNS = (
@@ -422,6 +422,9 @@ class PhaseSevenEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Already stored", index_response.text)
                 self.assertIn("This extraction was not applied", index_response.text)
                 self.assertIn("Price (clean)", index_response.text)
+                self.assertIn("Failure category", index_response.text)
+                self.assertIn("Correlation ID", index_response.text)
+                self.assertNotIn("Raw model output", index_response.text)
 
     async def test_api_errors_do_not_echo_sensitive_exception_details(self):
         upload_id = "synthetic-error-upload"
@@ -503,6 +506,7 @@ class PhaseSevenEndToEndTests(unittest.IsolatedAsyncioTestCase):
                         return_value=100,
                     ),
                     patch.object(app, "get_bond_reference_index", return_value=None),
+                    self.assertLogs(app.logger, level="WARNING") as captured,
                 ):
                     extraction_response = client.post(f"/extract/{upload_id}")
                 self.assertEqual(extraction_response.status_code, 200)
@@ -510,6 +514,20 @@ class PhaseSevenEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     extraction["context_errors"][0]["error"],
                     "Extraction failed for this context.",
+                )
+                self.assertIsNone(
+                    extraction["context_errors"][0]["raw_llm_output"]
+                )
+                self.assertTrue(
+                    extraction["context_errors"][0]["correlation_id"]
+                )
+                self.assertNotIn(
+                    "SYNTHETIC_SECRET",
+                    "\n".join(captured.output),
+                )
+                self.assertIn(
+                    extraction["context_errors"][0]["correlation_id"],
+                    "\n".join(captured.output),
                 )
                 for secret in (
                     r"c:\synthetic\private",
@@ -521,6 +539,118 @@ class PhaseSevenEndToEndTests(unittest.IsolatedAsyncioTestCase):
                         secret.casefold(),
                         extraction_response.text.casefold(),
                     )
+
+                reference_error = (
+                    r"C:\synthetic\private\ISIN_DETAILS.csv "
+                    "credential=SYNTHETIC_SECRET"
+                )
+                app._store_upload_session(upload_id, {
+                    "upload_id": upload_id,
+                    "parsed_messages": [],
+                    "parse_report": {},
+                })
+                with (
+                    patch.object(
+                        app.pipeline,
+                        "group_into_trade_contexts",
+                        return_value=([context], []),
+                    ),
+                    patch.object(
+                        app.pipeline,
+                        "call_llm_extraction",
+                        return_value=(
+                            {"deals": [], "prompt_version": "synthetic"},
+                            {
+                                "prompt_tokens": 0,
+                                "completion_tokens": 0,
+                                "total_tokens": 0,
+                            },
+                        ),
+                    ),
+                    patch.object(
+                        app.pipeline,
+                        "get_model_context_length",
+                        return_value=100,
+                    ),
+                    patch.object(
+                        app,
+                        "get_bond_reference_index",
+                        side_effect=BondReferenceError(reference_error),
+                    ),
+                ):
+                    reference_response = client.post(f"/extract/{upload_id}")
+                self.assertEqual(reference_response.status_code, 200)
+                reference_report = reference_response.json()
+                self.assertEqual(
+                    reference_report["bond_reference_error"],
+                    "Bond reference data is unavailable. Check BOND_REFERENCE_CSV.",
+                )
+                for secret in (
+                    r"c:\synthetic\private",
+                    "ISIN_DETAILS.csv",
+                    "credential",
+                    "SYNTHETIC_SECRET",
+                ):
+                    self.assertNotIn(
+                        secret.casefold(),
+                        reference_response.text.casefold(),
+                    )
+
+                app._store_upload_session(upload_id, {
+                    "upload_id": upload_id,
+                    "parsed_messages": [],
+                    "parse_report": {},
+                })
+                with (
+                    patch.object(
+                        app.pipeline,
+                        "group_into_trade_contexts",
+                        return_value=([context], []),
+                    ),
+                    patch.object(
+                        app.pipeline,
+                        "call_llm_extraction",
+                        return_value=(
+                            {
+                                "deals": [{}],
+                                "prompt_version": "synthetic",
+                            },
+                            {
+                                "prompt_tokens": 0,
+                                "completion_tokens": 0,
+                                "total_tokens": 0,
+                            },
+                        ),
+                    ),
+                    patch.object(
+                        app.pipeline,
+                        "validate_extraction",
+                        return_value={
+                            "extraction_failed": True,
+                            "raw_text": sensitive_error,
+                            "error": sensitive_error,
+                            "prompt_version": "synthetic",
+                        },
+                    ),
+                    patch.object(
+                        app.pipeline,
+                        "get_model_context_length",
+                        return_value=100,
+                    ),
+                    patch.object(app, "get_bond_reference_index", return_value=None),
+                ):
+                    invalid_deal_response = client.post(f"/extract/{upload_id}")
+                self.assertEqual(invalid_deal_response.status_code, 200)
+                invalid_deal = invalid_deal_response.json()["extractions"][0]
+                self.assertEqual(
+                    invalid_deal["error"],
+                    "A model deal could not be validated.",
+                )
+                self.assertNotIn("raw_text", invalid_deal)
+                self.assertNotIn(
+                    "SYNTHETIC_SECRET",
+                    invalid_deal_response.text,
+                )
 
         upload = StarletteUploadFile(
             filename="synthetic-upload.txt",

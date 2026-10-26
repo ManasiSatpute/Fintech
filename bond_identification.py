@@ -279,7 +279,10 @@ def identify_extracted_deal(
     if reference_error:
         result = replace(
             result,
-            explanation=f"Bond reference data unavailable: {reference_error}",
+            explanation=(
+                "Bond reference data is unavailable. Check BOND_REFERENCE_CSV "
+                "before using this identification result."
+            ),
         )
     return result
 

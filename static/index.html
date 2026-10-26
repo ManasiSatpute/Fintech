@@ -545,10 +545,12 @@
                       <span class="spec-label">Error</span>
                       <span class="spec-value">${escapeHtml(d.error || 'Unable to parse model output')}</span>
                     </div>
-                    <div class="spec-item">
-                      <span class="spec-label">Raw model output</span>
-                      <span class="spec-value">${escapeHtml(d.raw_text || '')}</span>
-                    </div>
+                    ${d.error_category
+                      ? `<div class="spec-item"><span class="spec-label">Failure category</span><span class="spec-value">${escapeHtml(d.error_category)}</span></div>`
+                      : ''}
+                    ${d.correlation_id
+                      ? `<div class="spec-item"><span class="spec-label">Correlation ID</span><span class="spec-value">${escapeHtml(d.correlation_id)}</span></div>`
+                      : ''}
                   </div>
                 </div>
               `;

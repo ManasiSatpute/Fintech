@@ -60,7 +60,7 @@ class ExtractionSchemaTests(unittest.TestCase):
         self.assertIn("Compact conversation glossary", second_prompt)
         self.assertIn("Synthetic examples", second_prompt)
 
-    def test_exhausted_parse_failure_preserves_raw_text_not_discarded_status(self):
+    def test_exhausted_parse_failure_does_not_expose_raw_model_text(self):
         raw_text = "not-json model response"
         llm = SimpleNamespace(invoke=Mock(return_value=response(raw_text)))
         with patch.object(pipeline, "ChatOllama", return_value=llm):
@@ -68,10 +68,35 @@ class ExtractionSchemaTests(unittest.TestCase):
                 result, tokens = pipeline.call_llm_extraction("synthetic context")
 
         self.assertTrue(result["extraction_failed"])
-        self.assertEqual(result["raw_text"], raw_text)
+        self.assertIsNone(result["raw_text"])
+        self.assertNotIn(raw_text, str(result))
+        self.assertEqual(result["error_category"], "invalid_model_response")
+        self.assertTrue(result["correlation_id"])
         self.assertNotIn("DISCARDED", result)
+        self.assertEqual(result["error"], "Model extraction failed. Retry or check the model service.")
         self.assertEqual(result["prompt_version"], pipeline.PROMPT_VERSION)
         self.assertEqual(tokens["attempts"], 1)
+
+    def test_provider_exception_details_are_not_returned_or_retried_in_prompt(self):
+        secret_like_error = (
+            r"C:\synthetic\private\settings.env credential=SYNTHETIC_SECRET"
+        )
+        llm = SimpleNamespace(
+            invoke=Mock(side_effect=RuntimeError(secret_like_error))
+        )
+        with patch.object(pipeline, "ChatOllama", return_value=llm):
+            with patch.object(pipeline.config, "LLM_RETRIES", 1):
+                result, tokens = pipeline.call_llm_extraction("synthetic context")
+
+        self.assertTrue(result["extraction_failed"])
+        self.assertIsNone(result["raw_text"])
+        self.assertEqual(result["error_category"], "provider_error")
+        self.assertTrue(result["correlation_id"])
+        self.assertNotIn("SYNTHETIC_SECRET", str(result))
+        self.assertNotIn(r"C:\synthetic", str(result))
+        self.assertNotIn("SYNTHETIC_SECRET", llm.invoke.call_args_list[1].args[0])
+        self.assertNotIn("DISCARDED", result)
+        self.assertEqual(tokens["attempts"], 2)
 
     def test_legacy_validator_does_not_add_t1_or_december_31(self):
         deal = pipeline.validate_extraction({

@@ -5,6 +5,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import bond_reference
 import db
@@ -151,12 +152,36 @@ class BondReferenceTests(unittest.TestCase):
         self.assertIsNotNone(index.lookup_isin("GOOD"))
 
     def test_missing_file_is_reported(self):
-        missing_path = self.directory / "missing.csv"
+        missing_path = self.directory / "synthetic-missing.csv"
 
-        with self.assertRaisesRegex(
-            bond_reference.BondReferenceError, "does not exist"
-        ):
-            bond_reference.BondReferenceIndex.load(missing_path)
+        with self.assertLogs(bond_reference.logger, level="ERROR") as captured:
+            with self.assertRaises(bond_reference.BondReferenceError) as raised:
+                bond_reference.BondReferenceIndex.load(missing_path)
+        self.assertIn("Check BOND_REFERENCE_CSV", str(raised.exception))
+        self.assertNotIn(str(missing_path), str(raised.exception))
+        self.assertIn(str(missing_path), "\n".join(captured.output))
+
+    def test_read_exception_details_are_logged_but_not_in_public_error(self):
+        self.write_csv([self.record()])
+        injected_detail = (
+            r"C:\synthetic\private\reference.csv credential=SYNTHETIC_SECRET"
+        )
+
+        with self.assertLogs(bond_reference.logger, level="ERROR") as captured:
+            with patch.object(
+                Path,
+                "read_bytes",
+                side_effect=PermissionError(injected_detail),
+            ):
+                with self.assertRaises(
+                    bond_reference.BondReferenceError
+                ) as raised:
+                    bond_reference.BondReferenceIndex.load(self.csv_path)
+
+        self.assertIn("permissions", str(raised.exception))
+        self.assertNotIn("SYNTHETIC_SECRET", str(raised.exception))
+        self.assertNotIn(injected_detail, "\n".join(captured.output))
+        self.assertIn("error_type=PermissionError", "\n".join(captured.output))
 
     def test_metadata_includes_hash_filename_timestamp_counts_and_validation(self):
         self.write_csv([self.record(isin="META")])

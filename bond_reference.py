@@ -3,6 +3,7 @@
 import csv
 import hashlib
 import io
+import logging
 import threading
 import unicodedata
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from types import MappingProxyType
 from typing import Dict, Mapping, Optional, Tuple, Union
 
 import config
+
+logger = logging.getLogger(__name__)
 
 REQUIRED_COLUMNS = (
     "ISIN",
@@ -128,29 +131,58 @@ class BondReferenceIndex:
     ) -> "BondReferenceIndex":
         path = Path(csv_path if csv_path is not None else config.BOND_REFERENCE_CSV)
         if not path.is_file():
+            logger.error(
+                "Bond reference CSV unavailable: category=missing_file path=%s",
+                path,
+            )
             raise BondReferenceError(
-                f"Bond reference CSV does not exist or is not a file: {path}"
+                "Bond reference CSV was not found. Check BOND_REFERENCE_CSV."
             )
 
         try:
             raw_bytes = path.read_bytes()
         except OSError as exc:
+            logger.error(
+                "Bond reference CSV unavailable: category=read_error path=%s "
+                "error_type=%s",
+                path,
+                type(exc).__name__,
+            )
             raise BondReferenceError(
-                f"Unable to read bond reference CSV at {path}: {exc}"
+                "Bond reference CSV could not be read. Check the configured "
+                "file and its permissions."
             ) from exc
         digest = hashlib.sha256(raw_bytes).hexdigest()
-        text, encoding = _decode_csv(raw_bytes)
+        try:
+            text, encoding = _decode_csv(raw_bytes)
+        except BondReferenceError:
+            logger.error(
+                "Bond reference CSV unavailable: category=unsupported_encoding "
+                "path=%s",
+                path,
+            )
+            raise
         del raw_bytes
 
         reader = csv.reader(io.StringIO(text, newline=""), strict=True)
         try:
             headers = next(reader, None)
         except csv.Error as exc:
+            logger.error(
+                "Bond reference CSV unavailable: category=invalid_header "
+                "path=%s error_type=%s",
+                path,
+                type(exc).__name__,
+            )
             raise BondReferenceError(
-                f"Unable to parse bond reference CSV header at {path}: {exc}"
+                "Bond reference CSV header could not be parsed."
             ) from exc
         if headers is None:
-            raise BondReferenceError(f"Bond reference CSV is empty: {path}")
+            logger.error(
+                "Bond reference CSV unavailable: category=empty_file path=%s",
+                path,
+            )
+            raise BondReferenceError("Bond reference CSV is empty.")
 
         normalized_headers = [header.strip() for header in headers]
         missing_columns = [
@@ -169,9 +201,14 @@ class BondReferenceIndex:
                     "duplicate required columns: "
                     + ", ".join(duplicate_required_headers)
                 )
+            logger.error(
+                "Bond reference CSV unavailable: category=invalid_columns "
+                "path=%s details=%s",
+                path,
+                "; ".join(details),
+            )
             raise BondReferenceError(
-                f"Invalid bond reference CSV header at {path} "
-                f"({'; '.join(details)})."
+                f"Bond reference CSV has {'; '.join(details)}."
             )
 
         column_indexes = {
@@ -236,10 +273,16 @@ class BondReferenceIndex:
         successfully_loaded = sum(len(records) for records in rows_by_isin.values())
         rejected_records = total_source_rows - successfully_loaded
         if not successfully_loaded:
+            logger.error(
+                "Bond reference CSV unavailable: category=no_usable_records "
+                "path=%s source_rows=%s rejected_records=%s",
+                path,
+                total_source_rows,
+                rejected_records,
+            )
             raise BondReferenceError(
                 f"Bond reference CSV contains no usable records "
-                f"({total_source_rows} source rows, {rejected_records} rejected): "
-                f"{path}"
+                f"({total_source_rows} source rows, {rejected_records} rejected)."
             )
 
         duplicate_identifier_count = 0

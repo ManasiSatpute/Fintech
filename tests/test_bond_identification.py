@@ -157,6 +157,23 @@ class BondIdentificationIntegrationTests(unittest.TestCase):
         self.assertEqual(result.status, BondMatchStatus.CONFLICTING_EVIDENCE)
         self.assertIsNone(result.matched_reference)
 
+    def test_reference_error_explanation_does_not_include_diagnostic_details(self):
+        diagnostic = (
+            r"C:\synthetic\private\reference.csv credential=SYNTHETIC_SECRET"
+        )
+
+        result = identify_extracted_deal(
+            {},
+            [],
+            {},
+            None,
+            reference_error=diagnostic,
+        )
+
+        self.assertIn("BOND_REFERENCE_CSV", result.explanation)
+        self.assertNotIn("SYNTHETIC_SECRET", result.explanation)
+        self.assertNotIn(r"C:\synthetic", result.explanation)
+
     def test_missing_or_uncorroborated_identity_stays_unresolved(self):
         result = self.identify(
             "Synthetic trade discussion",
