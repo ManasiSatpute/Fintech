@@ -10,7 +10,9 @@ Connects the Chat-style UI to the Python backend with:
 """
 
 import os
+import time
 import uuid
+from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -34,6 +36,31 @@ app.add_middleware(
 
 # In-memory session cache for uploads
 UPLOAD_SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+
+def _prune_expired_upload_sessions(now: float) -> None:
+    expired_ids = [
+        key
+        for key, session in UPLOAD_SESSIONS.items()
+        if now - session.get("_created_monotonic", 0)
+        >= config.UPLOAD_SESSION_TTL_SECONDS
+    ]
+    for expired_id in expired_ids:
+        del UPLOAD_SESSIONS[expired_id]
+
+
+def _store_upload_session(upload_id: str, session: Dict[str, Any]) -> None:
+    now = time.monotonic()
+    _prune_expired_upload_sessions(now)
+    session["_created_monotonic"] = now
+    UPLOAD_SESSIONS[upload_id] = session
+
+
+def _get_upload_session(upload_id: str) -> Optional[Dict[str, Any]]:
+    now = time.monotonic()
+    _prune_expired_upload_sessions(now)
+    return UPLOAD_SESSIONS.get(upload_id)
+
 
 # Ensure static folder exists
 os.makedirs("static", exist_ok=True)
@@ -66,7 +93,7 @@ async def upload_file(file: UploadFile = File(...)):
         return_report=True,
     )
 
-    UPLOAD_SESSIONS[upload_id] = {
+    _store_upload_session(upload_id, {
         "upload_id": upload_id,
         "filename": filename,
         "raw_text": raw_text,
@@ -75,7 +102,10 @@ async def upload_file(file: UploadFile = File(...)):
         "extractions": [],
         "token_usage": {},
         "context_window": {},
-    }
+        "context_message_maps": {},
+        "prompt_version": pipeline.PROMPT_VERSION,
+        "model_name": pipeline.MODEL_NAME,
+    })
 
     return {
         "upload_id": upload_id,
@@ -104,85 +134,56 @@ async def extract_trades(upload_id: str):
     - Step 6: Real token usage & context window calculation
     - Step 7: Business-rule validation
     """
-    session = UPLOAD_SESSIONS.get(upload_id)
+    session = _get_upload_session(upload_id)
     if not session:
         raise HTTPException(status_code=404, detail="Upload session not found. Please upload a file first.")
 
     parsed_messages = session["parsed_messages"]
-    if not parsed_messages:
-        return {
-            "upload_id": upload_id,
-            "prompt_version": pipeline.PROMPT_VERSION,
-            "trade_contexts_count": 0,
-            "extractions": [],
-            "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            "context_window": {
-                "used_tokens": 0,
-                "max_tokens": config.MODEL_CONTEXT_LENGTH_FALLBACK,
-                "percentage": 0.0,
-            },
-        }
-
-    # 4. Clean + route + group into trade contexts
     contexts, skipped_low_relevance = pipeline.group_into_trade_contexts(
         parsed_messages,
         return_skipped=True,
     )
-
-    if not contexts:
-        return {
-            "upload_id": upload_id,
-            "prompt_version": pipeline.PROMPT_VERSION,
-            "trade_contexts_count": 0,
-            "skipped_low_relevance": len(skipped_low_relevance),
-            "message": "No bond-relevant trade negotiation contexts detected in chat.",
-            "extractions": [],
-            "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            "context_window": {
-                "used_tokens": 0,
-                "max_tokens": pipeline.get_model_context_length(),
-                "percentage": 0.0,
-            },
-        }
-
-    # 5. Extract via LLM for each context
+    contexts.sort(key=lambda context: context["start"])
     extractions = []
+    context_errors = []
     total_prompt_tokens = 0
     total_completion_tokens = 0
     max_single_call_tokens = 0
 
-    selected_contexts = (
-        contexts
-        if config.MAX_CONTEXTS is None
-        else contexts[:config.MAX_CONTEXTS]
-    )
+    selected_contexts = contexts
+    if config.MAX_CONTEXTS is not None:
+        selected_contexts = selected_contexts[:config.MAX_CONTEXTS]
+    skipped_context_limit = len(contexts) - len(selected_contexts)
+    context_message_maps = {
+        ctx["context_id"]: ctx["message_number_map"]
+        for ctx in selected_contexts
+    }
+    processed_contexts = 0
+    failed_contexts = 0
 
     for ctx in selected_contexts:
-        extraction_result, tokens = pipeline.call_llm_extraction(ctx["snippet_text"])
+        extraction_result: Dict[str, Any] = {}
+        tokens: Dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        try:
+            extraction_result, tokens = pipeline.call_llm_extraction(
+                ctx["snippet_text"]
+            )
+            prompt_tk = tokens.get("prompt_tokens", 0)
+            compl_tk = tokens.get("completion_tokens", 0)
+            tot_tk = tokens.get("total_tokens", prompt_tk + compl_tk)
+            total_prompt_tokens += prompt_tk
+            total_completion_tokens += compl_tk
+            max_single_call_tokens = max(max_single_call_tokens, tot_tk)
 
-        prompt_tk = tokens.get("prompt_tokens", 0)
-        compl_tk = tokens.get("completion_tokens", 0)
-        tot_tk = tokens.get("total_tokens", prompt_tk + compl_tk)
+            if extraction_result.get("extraction_failed"):
+                raise RuntimeError(
+                    str(extraction_result.get("error") or "Extraction failed")
+                )
 
-        total_prompt_tokens += prompt_tk
-        total_completion_tokens += compl_tk
-        if tot_tk > max_single_call_tokens:
-            max_single_call_tokens = tot_tk
-
-        if extraction_result.get("extraction_failed"):
-            failed_result = dict(extraction_result)
-            failed_result["context_id"] = ctx["context_id"]
-            failed_result["group_name"] = ctx.get("group_name", "Default")
-            failed_result["message_indices"] = ctx["message_indices"]
-            failed_result["snippet_text"] = ctx["snippet_text"]
-            failed_result["call_tokens"] = tokens
-            extractions.append(failed_result)
-            continue
-
-        for deal in extraction_result.get("deals", []):
-            if not isinstance(deal, dict):
-                continue
-            # Step 7: Validate business rules
             context_datetime = max(
                 (
                     message["dt"]
@@ -191,19 +192,59 @@ async def extract_trades(upload_id: str):
                 ),
                 default=None,
             )
-            validated_deal = pipeline.validate_extraction(
-                deal,
-                context_snippet=ctx["snippet_text"],
-                message_datetime=context_datetime,
+            for deal in extraction_result.get("deals", []):
+                if not isinstance(deal, dict):
+                    raise ValueError("Model returned a non-object deal")
+                validated_deal = pipeline.validate_extraction(
+                    deal,
+                    context_snippet=ctx["snippet_text"],
+                    message_datetime=context_datetime,
+                )
+                validated_deal.update({
+                    "context_id": ctx["context_id"],
+                    "chat_key": ctx["chat_key"],
+                    "chat_name": ctx["chat_name"],
+                    "chat_type": ctx["chat_type"],
+                    "message_ids": ctx["message_ids"],
+                    "group_name": ctx.get("group_name", "Default"),
+                    "message_indices": ctx["message_indices"],
+                    "message_number_map": ctx["message_number_map"],
+                    "snippet_text": ctx["snippet_text"],
+                    "call_tokens": tokens,
+                    "prompt_version": extraction_result["prompt_version"],
+                    "model_name": pipeline.MODEL_NAME,
+                })
+                extractions.append(validated_deal)
+            processed_contexts += 1
+        except Exception as error:
+            failed_contexts += 1
+            raw_output = extraction_result.get(
+                "raw_text",
+                extraction_result.get("raw_output"),
             )
-            validated_deal["context_id"] = ctx["context_id"]
-            validated_deal["group_name"] = ctx.get("group_name", "Default")
-            validated_deal["message_indices"] = ctx["message_indices"]
-            validated_deal["snippet_text"] = ctx["snippet_text"]
-            validated_deal["call_tokens"] = tokens
-            validated_deal["prompt_version"] = extraction_result["prompt_version"]
-
-            extractions.append(validated_deal)
+            context_error = {
+                "context_id": ctx["context_id"],
+                "error": str(error),
+                "raw_llm_output": raw_output,
+                "call_tokens": tokens,
+                "chat_key": ctx["chat_key"],
+                "chat_name": ctx["chat_name"],
+                "chat_type": ctx["chat_type"],
+                "message_ids": ctx["message_ids"],
+            }
+            context_errors.append(context_error)
+            extractions.append({
+                "extraction_failed": True,
+                **context_error,
+                "chat_key": ctx["chat_key"],
+                "chat_name": ctx["chat_name"],
+                "chat_type": ctx["chat_type"],
+                "message_ids": ctx["message_ids"],
+                "message_indices": ctx["message_indices"],
+                "message_number_map": ctx["message_number_map"],
+                "prompt_version": pipeline.PROMPT_VERSION,
+                "model_name": pipeline.MODEL_NAME,
+            })
 
     # Step 6: Query real context window length & compute usage
     max_context_length = pipeline.get_model_context_length()
@@ -225,17 +266,55 @@ async def extract_trades(upload_id: str):
         "percentage": ctx_percentage,
         "model_name": pipeline.MODEL_NAME,
     }
+    deals_by_status = dict(sorted(Counter(
+        deal.get("status") or "UNKNOWN"
+        for deal in extractions
+        if not deal.get("extraction_failed")
+    ).items()))
+    parse_report = session.get("parse_report", {})
+    system_count = sum(
+        bool(message.get("is_system"))
+        for message in parsed_messages
+    )
 
     # Save to session
     session["extractions"] = extractions
     session["token_usage"] = token_usage
     session["context_window"] = context_window
+    session["context_message_maps"] = context_message_maps
+    session["prompt_version"] = pipeline.PROMPT_VERSION
+    session["model_name"] = pipeline.MODEL_NAME
+    session["context_errors"] = context_errors
+    session["context_chat_info"] = {
+        ctx["context_id"]: {
+            "chat_key": ctx["chat_key"],
+            "chat_name": ctx["chat_name"],
+            "chat_type": ctx["chat_type"],
+            "message_ids": ctx["message_ids"],
+        }
+        for ctx in selected_contexts
+    }
 
     return {
         "upload_id": upload_id,
         "trade_contexts_count": len(selected_contexts),
+        "contexts_detected": len(contexts),
         "total_contexts_detected": len(contexts),
         "skipped_low_relevance": len(skipped_low_relevance),
+        "skipped_context_limit": skipped_context_limit,
+        "messages_parsed": len(parsed_messages),
+        "media": parse_report.get("media", 0),
+        "system": system_count,
+        "skipped_on_parse": parse_report.get("skipped", 0),
+        "processed": processed_contexts,
+        "failed": failed_contexts,
+        "context_errors": context_errors,
+        "deals_by_status": deals_by_status,
+        "needs_review_count": sum(
+            bool(deal.get("needs_review"))
+            for deal in extractions
+            if not deal.get("extraction_failed")
+        ),
         "extractions": extractions,
         "prompt_version": pipeline.PROMPT_VERSION,
         "token_usage": token_usage,
@@ -249,23 +328,12 @@ async def store_extracted_data(upload_id: str):
     Step 8 & 9: Persist parsed messages, distinct bonds, and transactions
     into SQLite database in a single atomic transaction.
     """
-    session = UPLOAD_SESSIONS.get(upload_id)
+    session = _get_upload_session(upload_id)
     if not session:
         raise HTTPException(status_code=404, detail="Upload session not found.")
 
     parsed_messages = session.get("parsed_messages", [])
     extractions = session.get("extractions", [])
-    if any(
-        "bond_identity_text" in deal or "extraction_failed" in deal
-        for deal in extractions
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "The current database schema cannot store the new extraction "
-                "format yet; no extracted deals were stored."
-            ),
-        )
 
     try:
         counts = db.persist_upload(
@@ -273,6 +341,9 @@ async def store_extracted_data(upload_id: str):
             chat_id=upload_id,
             parsed_messages=parsed_messages,
             validated_deals=extractions,
+            context_message_maps=session.get("context_message_maps", {}),
+            prompt_version=session.get("prompt_version"),
+            model_name=session.get("model_name"),
         )
 
         return {
@@ -350,7 +421,7 @@ def load_sample_file(filename: str):
         return_report=True,
     )
 
-    UPLOAD_SESSIONS[upload_id] = {
+    _store_upload_session(upload_id, {
         "upload_id": upload_id,
         "filename": safe_name,
         "raw_text": raw_text,
@@ -359,7 +430,10 @@ def load_sample_file(filename: str):
         "extractions": [],
         "token_usage": {},
         "context_window": {},
-    }
+        "context_message_maps": {},
+        "prompt_version": pipeline.PROMPT_VERSION,
+        "model_name": pipeline.MODEL_NAME,
+    })
 
     return {
         "upload_id": upload_id,

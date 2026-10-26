@@ -88,7 +88,9 @@ class ExtractionSchemaTests(unittest.TestCase):
         self.assertIn("any bids?", prompt)
         self.assertIn("holding bid at X", prompt)
         self.assertIn("not acceptance", prompt)
-        self.assertEqual(len(pipeline.EXTRACTION_EXAMPLES), 4)
+        self.assertIn("specific offer or inquiry", prompt)
+        self.assertIn("pass_or_refusal", prompt)
+        self.assertEqual(len(pipeline.EXTRACTION_EXAMPLES), 10)
         self.assertIn(
             'A number after an ISIN joined by a hyphen (for example "<ISIN> - 43") is a unit count, never a yield.',
             prompt,

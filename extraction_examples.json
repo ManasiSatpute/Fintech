@@ -194,5 +194,226 @@
         }
       ]
     }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: PRIVATE\nDate: 2026-10-01\n#1 [OWN] Desk: Offering Synthetic Bond at 10.08 for 5 cr\n#2 Trader A: no requirement",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": "Synthetic Bond",
+          "isin_text": null,
+          "issuer_text": null,
+          "maturity_text": null,
+          "coupon_rate": null,
+          "credit_rating": null,
+          "quantity_text": "5 cr",
+          "ytm": "10.08",
+          "ytm_is_two_way": false,
+          "price": null,
+          "settlement_text": null,
+          "owner_side": "SELL",
+          "buyer_text": null,
+          "seller_text": "Desk",
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": true,
+          "status": "CANCELLED",
+          "status_evidence": "no requirement",
+          "discard_reason": null,
+          "evidence": {
+            "bond_identity_text": ["#1"],
+            "quantity_text": ["#1"],
+            "ytm": ["#1"],
+            "owner_side": ["#1"],
+            "seller_text": ["#1"],
+            "is_indicative": ["#1"],
+            "status": ["#2"],
+            "status_evidence": ["#2"]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: PRIVATE\nDate: 2026-10-01\n#1 [OWN] Desk: offer pls",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": null,
+          "isin_text": null,
+          "issuer_text": null,
+          "maturity_text": null,
+          "coupon_rate": null,
+          "credit_rating": null,
+          "quantity_text": null,
+          "ytm": null,
+          "ytm_is_two_way": null,
+          "price": null,
+          "settlement_text": null,
+          "owner_side": "BUY",
+          "buyer_text": "Desk",
+          "seller_text": null,
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": true,
+          "status": "INITIATED",
+          "status_evidence": "offer pls",
+          "discard_reason": null,
+          "evidence": {
+            "owner_side": ["#1"],
+            "buyer_text": ["#1"],
+            "is_indicative": ["#1"],
+            "status": ["#1"],
+            "status_evidence": ["#1"]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: PRIVATE\nDate: 2026-10-01\n#1 [OWN] Desk: 10% offer",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": null,
+          "isin_text": null,
+          "issuer_text": null,
+          "maturity_text": null,
+          "coupon_rate": null,
+          "credit_rating": null,
+          "quantity_text": null,
+          "ytm": null,
+          "ytm_is_two_way": null,
+          "price": null,
+          "settlement_text": null,
+          "owner_side": "SELL",
+          "buyer_text": null,
+          "seller_text": "Desk",
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": true,
+          "status": "INITIATED",
+          "status_evidence": "10% offer",
+          "discard_reason": null,
+          "evidence": {
+            "owner_side": ["#1"],
+            "seller_text": ["#1"],
+            "is_indicative": ["#1"],
+            "status": ["#1"],
+            "status_evidence": ["#1"]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: PRIVATE\nDate: 2026-10-01\n#1 [OWN] Desk: bid pls",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": null,
+          "isin_text": null,
+          "issuer_text": null,
+          "maturity_text": null,
+          "coupon_rate": null,
+          "credit_rating": null,
+          "quantity_text": null,
+          "ytm": null,
+          "ytm_is_two_way": null,
+          "price": null,
+          "settlement_text": null,
+          "owner_side": "SELL",
+          "buyer_text": null,
+          "seller_text": "Desk",
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": true,
+          "status": "INITIATED",
+          "status_evidence": "bid pls",
+          "discard_reason": null,
+          "evidence": {
+            "owner_side": ["#1"],
+            "seller_text": ["#1"],
+            "is_indicative": ["#1"],
+            "status": ["#1"],
+            "status_evidence": ["#1"]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: PRIVATE\nDate: 2026-10-01\n#1 [OWN] Desk: bid at 10.08",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": null,
+          "isin_text": null,
+          "issuer_text": null,
+          "maturity_text": null,
+          "coupon_rate": null,
+          "credit_rating": null,
+          "quantity_text": null,
+          "ytm": "10.08",
+          "ytm_is_two_way": false,
+          "price": null,
+          "settlement_text": null,
+          "owner_side": "BUY",
+          "buyer_text": "Desk",
+          "seller_text": null,
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": false,
+          "status": "INITIATED",
+          "status_evidence": "bid at 10.08",
+          "discard_reason": null,
+          "evidence": {
+            "ytm": ["#1"],
+            "owner_side": ["#1"],
+            "buyer_text": ["#1"],
+            "is_indicative": ["#1"],
+            "status": ["#1"],
+            "status_evidence": ["#1"]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: PRIVATE\nDate: 2026-10-01\n#1 [OWN] Desk: ZZ0000000000 43 units T+1",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": null,
+          "isin_text": "ZZ0000000000",
+          "issuer_text": null,
+          "maturity_text": null,
+          "coupon_rate": null,
+          "credit_rating": null,
+          "quantity_text": "43 units",
+          "ytm": null,
+          "ytm_is_two_way": null,
+          "price": null,
+          "settlement_text": "T+1",
+          "owner_side": "UNKNOWN",
+          "buyer_text": null,
+          "seller_text": null,
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": null,
+          "status": "INITIATED",
+          "status_evidence": "ZZ0000000000 43 units T+1",
+          "discard_reason": null,
+          "evidence": {
+            "isin_text": ["#1"],
+            "quantity_text": ["#1"],
+            "settlement_text": ["#1"],
+            "owner_side": ["#1"],
+            "status": ["#1"],
+            "status_evidence": ["#1"]
+          }
+        }
+      ]
+    }
   }
 ]

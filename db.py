@@ -6,12 +6,17 @@ Implements the exact SQLite schema required:
 - transactions
 """
 
+import hashlib
+import json
 import sqlite3
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+import config
+
 DB_PATH = "bond_deals.db"
+SCHEMA_VERSION = 2
 
 # Exact DDL specified in requirements
 SCHEMA_SQL = """
@@ -21,8 +26,16 @@ CREATE TABLE IF NOT EXISTS messages (
     sender          TEXT NOT NULL,
     message_text    TEXT NOT NULL,
     timestamp       TEXT NOT NULL,         -- ISO 8601 datetime
-    transaction_id  TEXT,                  -- nullable FK -> transactions.transaction_id
-    FOREIGN KEY (transaction_id) REFERENCES transactions (transaction_id)
+    chat_key        TEXT,
+    chat_name       TEXT,
+    chat_type       TEXT,
+    direction       TEXT,
+    is_own          INTEGER NOT NULL CHECK (is_own IN (0, 1)),
+    is_media        INTEGER NOT NULL CHECK (is_media IN (0, 1)),
+    media_kind      TEXT,
+    replying_to_text TEXT,
+    noise_label     TEXT,
+    sender_hash     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS bonds (
@@ -49,13 +62,56 @@ CREATE TABLE IF NOT EXISTS transactions (
     is_indicative             INTEGER,          -- 0/1 boolean
     ytm                        REAL,
     final_price                 REAL,
-    settlement_reference          TEXT CHECK (settlement_reference IN ('T0','T1','T2')),
+    settlement_reference          TEXT CHECK (
+        settlement_reference IS NULL
+        OR settlement_reference IN ('T0','T1','T2','OTHER')
+    ),
     settlement_date                 TEXT,       -- ISO date
-    status                            TEXT NOT NULL CHECK (status IN
-                                          ('INCOMPLETE','CONCLUDED','DISCARDED')),
+    status                            TEXT CHECK (
+        status IS NULL OR status IN (
+            'INITIATED','NEGOTIATING','CONCLUDED','CANCELLED','UNCERTAIN','DISCARDED'
+        )
+    ),
     created_at                          TEXT NOT NULL,
     updated_at                           TEXT NOT NULL,
+    context_id                          TEXT,
+    chat_key                            TEXT,
+    owner_side                          TEXT,
+    buyer_text                          TEXT,
+    seller_text                         TEXT,
+    quantity_text                       TEXT,
+    amount_inr                          NUMERIC,
+    units_assumed                       INTEGER,
+    ytm_is_two_way                      INTEGER,
+    settlement_text                     TEXT,
+    maturity_text                       TEXT,
+    maturity_ym                         TEXT,
+    partial_isin_text                   TEXT,
+    rfq_id                              TEXT,
+    package_note                        TEXT,
+    evidence_json                       TEXT,
+    warnings_json                       TEXT,
+    missing_fields_json                 TEXT,
+    confidence                          REAL,
+    needs_review                        INTEGER,
+    prompt_version                      TEXT,
+    model_name                          TEXT,
     FOREIGN KEY (bond_id) REFERENCES bonds (bond_id)
+);
+
+CREATE TABLE IF NOT EXISTS transaction_messages (
+    transaction_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    PRIMARY KEY (transaction_id, message_id),
+    FOREIGN KEY (transaction_id) REFERENCES transactions (transaction_id),
+    FOREIGN KEY (message_id) REFERENCES messages (message_id)
+);
+"""
+
+SCHEMA_VERSION_SQL = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    version      INTEGER NOT NULL,
+    applied_at   TEXT NOT NULL
 );
 """
 
@@ -68,10 +124,125 @@ def get_db_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
 
 
 def init_db(db_path: str = DB_PATH) -> None:
-    """Initialize database tables with exact DDL."""
-    with get_db_connection(db_path) as conn:
+    """Initialize the current schema, refusing implicit legacy migrations."""
+    conn = get_db_connection(db_path)
+    try:
+        existing_tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        conn.executescript(SCHEMA_VERSION_SQL)
+        version_row = conn.execute(
+            "SELECT version FROM schema_version ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        if version_row is None and existing_tables:
+            raise RuntimeError(
+                "Database has no schema version and may use an older schema; "
+                "run reset_db(db_path) to recreate it (development only)."
+            )
+        if version_row is not None and version_row["version"] < SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Database schema version {version_row['version']} is older than "
+                f"required version {SCHEMA_VERSION}; run reset_db(db_path) to "
+                "recreate it (development only)."
+            )
+        if version_row is not None and version_row["version"] > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Database schema version {version_row['version']} is newer than "
+                f"supported version {SCHEMA_VERSION}."
+            )
         conn.executescript(SCHEMA_SQL)
+        if version_row is None:
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (SCHEMA_VERSION, datetime.now().isoformat()),
+            )
         conn.commit()
+    finally:
+        conn.close()
+
+def reset_db(db_path: str = DB_PATH) -> None:
+    """Drop and recreate all tables. For development databases only."""
+    conn = get_db_connection(db_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        for table in (
+            "transaction_messages",
+            "transactions",
+            "bonds",
+            "messages",
+            "schema_version",
+        ):
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.commit()
+        conn.executescript(SCHEMA_VERSION_SQL)
+        conn.executescript(SCHEMA_SQL)
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (SCHEMA_VERSION, datetime.now().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _sender_hash(sender_id: Any) -> Optional[str]:
+    if sender_id is None or not str(sender_id).strip():
+        return None
+    salted_sender_id = f"{config.SENDER_HASH_SALT}:{sender_id}".encode("utf-8")
+    return hashlib.sha256(salted_sender_id).hexdigest()
+
+
+def _sender_name_for_storage(message: Dict[str, Any]) -> str:
+    sender = str(message.get("sender") or "")
+    sender_number = str(message.get("sender_number") or "")
+    sender_digits = "".join(character for character in sender if character.isdigit())
+    number_digits = "".join(
+        character for character in sender_number if character.isdigit()
+    )
+    return "" if sender_digits and sender_digits == number_digits else sender
+
+
+def insert_messages(
+    conn: sqlite3.Connection,
+    messages: List[Dict[str, Any]],
+    upload_id: str,
+) -> int:
+    """Insert parsed messages once per stable message id."""
+    inserted = 0
+    for message in messages:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO messages (
+                message_id, chat_id, sender, message_text, timestamp,
+                chat_key, chat_name, chat_type, direction, is_own, is_media,
+                media_kind, replying_to_text, noise_label, sender_hash,
+                chat_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message["message_id"],
+                upload_id,
+                _sender_name_for_storage(message),
+                message["message_text"],
+                message["timestamp"],
+                message.get("chat_key"),
+                message.get("chat_name"),
+                message.get("chat_type"),
+                message.get("direction"),
+                int(bool(message.get("is_own", False))),
+                int(bool(message.get("is_media", False))),
+                message.get("media_kind"),
+                message.get("replying_to"),
+                message.get("noise_label"),
+                _sender_hash(message.get("sender_number")),
+                upload_id,
+            ),
+        )
+        inserted += cursor.rowcount
+    return inserted
 
 
 def persist_upload(
@@ -79,10 +250,12 @@ def persist_upload(
     chat_id: str,
     parsed_messages: List[Dict[str, Any]],
     validated_deals: List[Dict[str, Any]],
+    context_message_maps: Optional[Dict[str, Dict[str, str]]] = None,
+    prompt_version: Optional[str] = None,
+    model_name: Optional[str] = None,
 ) -> Dict[str, int]:
     """
-    Persist all messages, distinct bonds, and transactions in a single transaction.
-    Links messages belonging to a trade window with the transaction_id.
+    Persist all messages, distinct bonds, transactions, and deal/message links.
     """
     init_db(db_path)
     conn = get_db_connection(db_path)
@@ -93,20 +266,23 @@ def persist_upload(
 
     try:
         conn.execute("BEGIN TRANSACTION;")
+        messages_stored = insert_messages(conn, parsed_messages, chat_id)
 
-        # 1. Map each deal to a created or existing bond
-        # To avoid duplicate bond records for identical bonds, check by isin or bond_identity
-        deal_to_tx_id = {}
+        # IDENTITY-LADDER: bond identity resolution is intentionally unchanged.
         now_iso = datetime.now().isoformat()
 
         for deal_idx, deal in enumerate(validated_deals):
-            if not deal.get("is_valid", True):
-                # If discarded or invalid, don't store transaction
-                if deal.get("status") not in ("CONCLUDED", "INCOMPLETE"):
-                    continue
+            if deal.get("extraction_failed"):
+                continue
 
-            bond_identity = (deal.get("bond_identity") or "UNKNOWN").strip()
-            isin = (deal.get("isin") or "").strip().upper() or None
+            bond_identity = (
+                deal.get("bond_identity")
+                or deal.get("bond_identity_text")
+                or "UNKNOWN"
+            ).strip()
+            isin = (
+                deal.get("isin") or deal.get("isin_text") or ""
+            ).strip().upper() or None
             identity_type = deal.get("identity_type") or ("ISIN" if isin else "NAME_ONLY")
             if identity_type not in ('ISIN', 'CUSIP', 'SERIES', 'NAME_ONLY', 'UNKNOWN'):
                 identity_type = "UNKNOWN"
@@ -142,7 +318,7 @@ def persist_upload(
                         isin,
                         bond_identity,
                         identity_type,
-                        deal.get("issuer_name"),
+                        deal.get("issuer_name") or deal.get("issuer_text"),
                         deal.get("credit_rating"),
                         deal.get("maturity_date"),
                         float(deal["coupon_rate"]) if deal.get("coupon_rate") is not None else None,
@@ -154,15 +330,43 @@ def persist_upload(
 
             # Insert transaction
             tx_id = str(uuid.uuid4())
-            deal_to_tx_id[deal_idx] = tx_id
-
-            settlement_ref = deal.get("settlement_reference") or "T1"
-            if settlement_ref not in ('T0', 'T1', 'T2'):
-                settlement_ref = "T1"
-
-            status = deal.get("status") or "CONCLUDED"
-            if status not in ('INCOMPLETE', 'CONCLUDED', 'DISCARDED'):
-                status = "CONCLUDED"
+            normalized_quantity = deal.get("normalized_quantity")
+            if not isinstance(normalized_quantity, dict):
+                normalized_quantity = {}
+            amount_inr = normalized_quantity.get("amount_inr")
+            if isinstance(amount_inr, (dict, list)):
+                amount_inr = json.dumps(amount_inr, ensure_ascii=False)
+            quantity_value = normalized_quantity.get("value")
+            if isinstance(quantity_value, (dict, list)):
+                quantity_value = None
+            settlement_date = deal.get("settlement_date")
+            settlement_label = deal.get("settlement_label")
+            settlement_ref = None
+            if settlement_date is not None:
+                settlement_ref = (
+                    settlement_label
+                    if settlement_label in ("T0", "T1", "T2")
+                    else "OTHER"
+                )
+            status = deal.get("status")
+            if status not in {
+                "INITIATED",
+                "NEGOTIATING",
+                "CONCLUDED",
+                "CANCELLED",
+                "UNCERTAIN",
+                "DISCARDED",
+            }:
+                status = "UNCERTAIN"
+            validated_ytm = deal.get("ytm")
+            if isinstance(validated_ytm, str):
+                try:
+                    validated_ytm = float(validated_ytm)
+                except ValueError:
+                    validated_ytm = None
+            evidence = deal.get("evidence")
+            warnings = deal.get("warnings")
+            missing_fields = deal.get("missing_fields")
 
             conn.execute(
                 """
@@ -170,57 +374,126 @@ def persist_upload(
                     transaction_id, bond_id, buyer, seller,
                     quantity, quantity_unit, is_indicative, ytm,
                     final_price, settlement_reference, settlement_date,
-                    status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, created_at, updated_at, context_id, chat_key,
+                    owner_side, buyer_text, seller_text, quantity_text,
+                    amount_inr, units_assumed, ytm_is_two_way, settlement_text,
+                    maturity_text, maturity_ym, partial_isin_text, rfq_id,
+                    package_note, evidence_json, warnings_json,
+                    missing_fields_json, confidence, needs_review,
+                    prompt_version, model_name
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 """,
                 (
                     tx_id,
                     bond_id,
-                    deal.get("buyer"),
-                    deal.get("seller"),
-                    float(deal["quantity"]) if deal.get("quantity") is not None else None,
-                    deal.get("quantity_unit") or "Cr",
-                    int(deal.get("is_indicative", 0)),
-                    float(deal["ytm"]) if deal.get("ytm") is not None else None,
-                    float(deal["final_price"]) if deal.get("final_price") is not None else None,
+                    deal.get("buyer") or deal.get("buyer_text"),
+                    deal.get("seller") or deal.get("seller_text"),
+                    float(quantity_value) if quantity_value is not None else None,
+                    normalized_quantity.get("unit"),
+                    (
+                        int(bool(deal["is_indicative"]))
+                        if deal.get("is_indicative") is not None
+                        else None
+                    ),
+                    float(validated_ytm) if validated_ytm is not None else None,
+                    (
+                        float(deal["price"])
+                        if deal.get("price") is not None
+                        else deal.get("final_price")
+                    ),
                     settlement_ref,
-                    deal.get("settlement_date"),
+                    settlement_date,
                     status,
                     deal.get("created_at") or now_iso,
                     deal.get("updated_at") or now_iso,
+                    deal.get("context_id"),
+                    deal.get("chat_key"),
+                    deal.get("owner_side"),
+                    deal.get("buyer_text"),
+                    deal.get("seller_text"),
+                    deal.get("quantity_text"),
+                    amount_inr,
+                    (
+                        int(bool(normalized_quantity["units_assumed"]))
+                        if normalized_quantity.get("units_assumed") is not None
+                        else None
+                    ),
+                    (
+                        int(bool(deal["ytm_is_two_way"]))
+                        if deal.get("ytm_is_two_way") is not None
+                        else None
+                    ),
+                    deal.get("settlement_text"),
+                    deal.get("maturity_text"),
+                    deal.get("maturity_ym"),
+                    deal.get("partial_isin_text"),
+                    deal.get("rfq_id"),
+                    deal.get("package_note"),
+                    (
+                        json.dumps(evidence, ensure_ascii=False)
+                        if evidence is not None
+                        else None
+                    ),
+                    (
+                        json.dumps(warnings, ensure_ascii=False)
+                        if warnings is not None
+                        else None
+                    ),
+                    (
+                        json.dumps(missing_fields, ensure_ascii=False)
+                        if missing_fields is not None
+                        else None
+                    ),
+                    deal.get("confidence"),
+                    (
+                        int(bool(deal["needs_review"]))
+                        if deal.get("needs_review") is not None
+                        else None
+                    ),
+                    deal.get("prompt_version") or prompt_version,
+                    deal.get("model_name") or model_name,
                 ),
             )
             transactions_stored += 1
-
-        # 2. Insert all parsed messages and link transaction_id if part of a trade window
-        # Create a mapping of message index -> transaction_id
-        msg_tx_map = {}
-        for deal_idx, deal in enumerate(validated_deals):
-            tx_id = deal_to_tx_id.get(deal_idx)
-            if tx_id and "message_indices" in deal:
-                for idx in deal["message_indices"]:
-                    msg_tx_map[idx] = tx_id
-
-        for idx, msg in enumerate(parsed_messages):
-            msg_id = msg.get("message_id") or str(uuid.uuid4())
-            tx_id = msg_tx_map.get(idx) or msg.get("transaction_id")
-
-            conn.execute(
+            context_id = deal.get("context_id")
+            message_number_map = (context_message_maps or {}).get(
+                context_id,
+            ) or deal.get("message_number_map") or {}
+            cited_numbers = {
+                line_number
+                for field_lines in (evidence or {}).values()
+                if isinstance(field_lines, list)
+                for citation in field_lines
+                if isinstance(citation, str)
+                and (line_number := citation.strip()) in message_number_map
+            }
+            linked_message_ids = {
+                message_number_map[number]
+                for number in cited_numbers
+                if message_number_map.get(number)
+            }
+            if not linked_message_ids:
+                linked_message_ids.update(
+                    message_number_map.values()
+                )
+            if not linked_message_ids:
+                linked_message_ids.update(
+                    parsed_messages[index]["message_id"]
+                    for index in deal.get("message_indices", [])
+                    if isinstance(index, int)
+                    and 0 <= index < len(parsed_messages)
+                )
+            conn.executemany(
                 """
-                INSERT INTO messages (
-                    message_id, chat_id, sender, message_text, timestamp, transaction_id
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO transaction_messages (
+                    transaction_id, message_id
+                ) VALUES (?, ?)
                 """,
-                (
-                    msg_id,
-                    chat_id,
-                    msg["sender"],
-                    msg["message_text"],
-                    msg["timestamp"],
-                    tx_id,
-                ),
+                [(tx_id, message_id) for message_id in linked_message_ids],
             )
-            messages_stored += 1
 
         conn.commit()
         return {
@@ -237,7 +510,7 @@ def persist_upload(
 
 
 def fetch_database_data(db_path: str = DB_PATH) -> Dict[str, Any]:
-    """Retrieve stored rows for all three tables."""
+    """Retrieve stored rows and transaction-to-message links."""
     init_db(db_path)
     conn = get_db_connection(db_path)
     try:
@@ -249,12 +522,41 @@ def fetch_database_data(db_path: str = DB_PATH) -> Dict[str, Any]:
             ORDER BY t.created_at DESC
             """
         ).fetchall()
+        linked_message_rows = conn.execute(
+            """
+            SELECT transaction_id, message_id
+            FROM transaction_messages
+            ORDER BY transaction_id, message_id
+            """
+        ).fetchall()
+        linked_message_ids: Dict[str, List[str]] = {}
+        for row in linked_message_rows:
+            linked_message_ids.setdefault(row["transaction_id"], []).append(
+                row["message_id"]
+            )
+        transactions = []
+        for row in tx_rows:
+            transaction = dict(row)
+            transaction["message_ids"] = linked_message_ids.get(
+                transaction["transaction_id"],
+                [],
+            )
+            transaction["settlement_display"] = (
+                transaction.get("settlement_text")
+                or transaction.get("settlement_date")
+                or "—"
+            )
+            ytm = transaction.get("ytm")
+            transaction["ytm_display"] = (
+                f"{ytm:g}%" if ytm is not None else "—"
+            )
+            transactions.append(transaction)
 
         bonds_rows = conn.execute("SELECT * FROM bonds ORDER BY bond_identity ASC").fetchall()
         msgs_rows = conn.execute("SELECT * FROM messages ORDER BY timestamp ASC LIMIT 500").fetchall()
 
         return {
-            "transactions": [dict(r) for r in tx_rows],
+            "transactions": transactions,
             "bonds": [dict(r) for r in bonds_rows],
             "messages": [dict(r) for r in msgs_rows],
             "counts": {

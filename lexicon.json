@@ -70,6 +70,27 @@
     "can close?",
     "accpt nh krt ka"
   ],
+  "buyer_request_cues": [
+    "offer pls",
+    "offer please",
+    "need offer",
+    "any offer?",
+    "offers?"
+  ],
+  "seller_request_cues": [
+    "bid pls",
+    "bid please",
+    "any bids?",
+    "bids?"
+  ],
+  "seller_offer_cues": [
+    "offer at",
+    "i have an offer"
+  ],
+  "buyer_bid_cues": [
+    "bid at",
+    "i have a bid"
+  ],
   "marathi_hinglish_done": [
     "ata kela",
     "ho gaya",

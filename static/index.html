@@ -827,8 +827,16 @@
               }
             </td>
 
+            <td class="mono-cell">
+              ${escapeHtml(r.ytm_display || '—')}
+            </td>
+
             <td>
-              ${r.settlement_reference || 'T1'}
+              ${escapeHtml(r.settlement_text || r.settlement_date || '—')}
+            </td>
+
+            <td>
+              ${escapeHtml(r.settlement_date || '—')}
             </td>
 
             <td>
@@ -839,8 +847,26 @@
                     : 'badge-incomplete'
                 }"
               >
-                ${r.status}
+                ${escapeHtml(r.status ?? '—')}
               </span>
+            </td>
+
+            <td>
+              ${
+                r.needs_review === null || r.needs_review === undefined
+                  ? '—'
+                  : r.needs_review
+                    ? 'Yes'
+                    : 'No'
+              }
+            </td>
+
+            <td class="mono-cell">
+              ${
+                r.confidence === null || r.confidence === undefined
+                  ? '—'
+                  : r.confidence
+              }
             </td>
 
             <td class="mono-cell">
@@ -871,9 +897,13 @@
                   <th>Buyer</th>
                   <th>Seller</th>
                   <th>Quantity</th>
-                  <th>Price</th>
+                  <th>Price (clean)</th>
+                  <th>YTM</th>
                   <th>Settlement</th>
+                  <th>Settlement date</th>
                   <th>Status</th>
+                  <th>Needs review</th>
+                  <th>Confidence</th>
                   <th>Created</th>
                 </tr>
               </thead>

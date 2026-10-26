@@ -18,11 +18,20 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+def _module_missing(name: str) -> bool:
+    if name in sys.modules:
+        return sys.modules[name] is None
+    try:
+        return importlib.util.find_spec(name) is None
+    except (ValueError, ImportError):
+        return False
+
+
 def _load_pipeline() -> Tuple[Any, List[str]]:
     """Load pipeline code even when its optional Ollama adapters are absent."""
     missing_modules = []
     for module_name in ("ollama", "langchain_ollama"):
-        if importlib.util.find_spec(module_name) is None:
+        if _module_missing(module_name):
             missing_modules.append(module_name)
 
     if "ollama" in missing_modules:
@@ -93,12 +102,9 @@ def _window_counts(messages: List[Dict[str, Any]]) -> Tuple[int, int, int]:
 
 
 def _select_contexts(contexts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Preserve chronological order and apply the app context cap."""
-    return (
-        contexts
-        if config.MAX_CONTEXTS is None
-        else contexts[:config.MAX_CONTEXTS]
-    )
+    """Select chronologically, applying only an explicitly configured dev cap."""
+    ordered = sorted(contexts, key=lambda context: context.get("start", ""))
+    return ordered if config.MAX_CONTEXTS is None else ordered[:config.MAX_CONTEXTS]
 
 
 def _mock_extraction(_: str) -> Tuple[Dict[str, Any], Dict[str, int]]:

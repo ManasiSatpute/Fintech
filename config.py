@@ -33,15 +33,21 @@ def _int_setting(name: str, default: int, minimum: int = 0) -> int:
 
 
 OWN_SENDER_NAMES = _list_setting("OWN_SENDER_NAMES", [])
+SENDER_HASH_SALT = "fintech-sender-id-hash-v1"
 DAY_FIRST_DEFAULT = _bool_setting("DAY_FIRST_DEFAULT", True)
 GAP_MINUTES = _int_setting("GAP_MINUTES", 15)
 
-_max_contexts = os.getenv("MAX_CONTEXTS", "8").strip().lower()
+_max_contexts = os.getenv("MAX_CONTEXTS", "none").strip().lower()
 MAX_CONTEXTS: Optional[int] = (
     None if _max_contexts == "none" else int(_max_contexts)
 )
 if MAX_CONTEXTS is not None and MAX_CONTEXTS < 1:
     raise ValueError("MAX_CONTEXTS must be at least 1 or 'none'")
+UPLOAD_SESSION_TTL_SECONDS = _int_setting(
+    "UPLOAD_SESSION_TTL_SECONDS",
+    3600,
+    minimum=1,
+)
 
 MODEL_NAME = os.getenv("MODEL_NAME", "gemma4:31b-cloud")
 LLM_RETRIES = _int_setting("LLM_RETRIES", 1)

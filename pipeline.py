@@ -68,9 +68,9 @@ LEXICON = load_lexicon()
 EXTRACTION_EXAMPLES_PATH = Path(__file__).with_name("extraction_examples.json")
 with EXTRACTION_EXAMPLES_PATH.open(encoding="utf-8") as examples_file:
     EXTRACTION_EXAMPLES = json.load(examples_file)
-if not isinstance(EXTRACTION_EXAMPLES, list) or len(EXTRACTION_EXAMPLES) != 4:
+if not isinstance(EXTRACTION_EXAMPLES, list) or len(EXTRACTION_EXAMPLES) != 10:
     raise ValueError(
-        f"Expected four extraction examples in {EXTRACTION_EXAMPLES_PATH}"
+        f"Expected ten extraction examples in {EXTRACTION_EXAMPLES_PATH}"
     )
 
 
@@ -1039,6 +1039,14 @@ def format_context_snippet(
 # --------------------------------------------------------------------------
 
 PROMPT_VERSION = "bond-extraction-v2"
+EXTRACTION_STATUSES = {
+    "INITIATED",
+    "NEGOTIATING",
+    "CONCLUDED",
+    "CANCELLED",
+    "UNCERTAIN",
+    "DISCARDED",
+}
 
 
 class DealExtraction(BaseModel):
@@ -1100,13 +1108,19 @@ For every non-null value, evidence maps its field name to one or more exact
 numbered conversation lines such as ["#2", "#4"]. Do not invent line numbers.
 
 Trading semantics (direction words are always relative to who spoke):
-- "bid" means buy; "offer" means sell.
-- "any bids?" means the sender is the seller; "any offer?", "need", and
-  "required" mean the sender is the buyer.
+- A request for an offer ("offer pls", "offer please", "need offer",
+  "any offer?", "offers?") means the sender wants to BUY; a request for bids
+  ("bid pls", "bid please", "any bids?") means the sender wants to SELL.
+- A level-bearing offer ("offer at X", "I have an offer", or a quoted
+  percentage followed by "offer") means the sender is SELLING. A level-bearing
+  bid ("bid at X", "I have a bid") means the sender is BUYING.
 - "holding bid at X" is a firm buy level; "can take" is a buy level.
 - owner_side describes BUY/SELL relative to the [OWN] participant, not the
   speaker. Use UNKNOWN if direction cannot be established. buyer_text and
   seller_text must be copied exactly as written when stated.
+- If a message only gives an ISIN, units, and settlement as an order
+  instruction without stating a side, leave buyer_text and seller_text null
+  and set owner_side to UNKNOWN.
 
 Status rules:
 - INITIATED: an offer or inquiry has no response.
@@ -1114,8 +1128,12 @@ Status rules:
 - CONCLUDED requires identifiable key terms and later acceptance from the
   other side (for example, "ok lets close at 10.08" or "closed"). A bare "ok"
   unrelated to the trade is not acceptance.
-- CANCELLED requires explicit pass or withdrawal replying to a specific offer.
-  No reply remains INITIATED.
+- CANCELLED requires an explicit refusal from the other participant replying
+  to a specific offer or inquiry, either through a reply link or as the next
+  message in the same chat. Use the refusal line as status_evidence. Refusal
+  words include the configured pass_or_refusal glossary entries. If the
+  refusal cannot be tied to a specific offer or inquiry, use UNCERTAIN.
+  Silence remains INITIATED.
 - UNCERTAIN when evidence is ambiguous or insufficient to classify otherwise.
 - DISCARDED for operations, payments, allocation, validation, "reported" or
   "accepted" processing notices, and banter. Give a concise discard_reason.
@@ -1356,19 +1374,17 @@ def _value_appears_in_lines(field: str, value: Any, lines: List[str]) -> bool:
                     return True
         return False
     if field == "owner_side":
-        for line in lines:
-            body = _evidence_body(line)
-            lower = body.casefold()
-            if re.search(r"\bany\s+bids?\b", lower):
-                speaker_side = "SELL"
-            elif re.search(r"\bany\s+offers?\b", lower):
-                speaker_side = "BUY"
-            elif re.search(r"\b(?:bid|bids|buy|buyer|can\s+take|holding\s+bid|need|required|lena\s+hai|chahiye)\b", lower):
-                speaker_side = "BUY"
-            elif re.search(r"\b(?:offer|offers|sell|seller|dena\s+hai)\b", lower):
-                speaker_side = "SELL"
-            else:
-                continue
+        speaker_lines = [
+            (line, side)
+            for line in lines
+            if (side := _speaker_trade_side(_evidence_body(line))) is not None
+        ]
+        if not speaker_lines:
+            return value == "UNKNOWN"
+        if value == "UNKNOWN":
+            return False
+        for line, speaker_side in speaker_lines:
+            lower = _evidence_body(line).casefold()
             owner_is_speaker = "[own]" in lower
             owner_side = speaker_side if owner_is_speaker else (
                 "SELL" if speaker_side == "BUY" else "BUY"
@@ -1398,7 +1414,10 @@ def _value_appears_in_lines(field: str, value: Any, lines: List[str]) -> bool:
         if value == "CONCLUDED":
             return any(_ACCEPTANCE_RE.search(line) for line in bodies)
         if value == "CANCELLED":
-            return any(re.search(r"\b(?:pass|withdraw|cancel|not required)\b", line, re.I) for line in bodies)
+            return any(
+                _contains_lexicon_entry(line, "pass_or_refusal")
+                for line in bodies
+            )
         if value == "NEGOTIATING":
             return any(_COUNTER_RE.search(line) for line in bodies)
         if value == "DISCARDED":
@@ -1412,6 +1431,118 @@ def _value_appears_in_lines(field: str, value: Any, lines: List[str]) -> bool:
         and normalized_value in _evidence_normalize(line)
         for line in bodies
     )
+
+
+def _contains_lexicon_entry(text: str, category: str) -> bool:
+    normalized_text = _normalize_lexicon_text(text)
+    for entry in LEXICON.get(category, []):
+        normalized_entry = _normalize_lexicon_text(entry)
+        if normalized_entry and re.search(
+            rf"(?<!\w){re.escape(normalized_entry)}(?:s|ed|ing)?(?!\w)",
+            normalized_text,
+        ):
+            return True
+    return False
+
+
+def _speaker_trade_side(text: str) -> Optional[str]:
+    if _contains_lexicon_entry(text, "buyer_request_cues"):
+        return "BUY"
+    if _contains_lexicon_entry(text, "seller_request_cues"):
+        return "SELL"
+    if _contains_lexicon_entry(text, "seller_offer_cues") or re.search(
+        r"(?<!\w)\d+(?:[.,]\d+)?\s*%\s*offers?\b",
+        unicodedata.normalize("NFKC", text).translate(_EVIDENCE_DIGITS),
+        re.IGNORECASE,
+    ):
+        return "SELL"
+    if _contains_lexicon_entry(text, "buyer_bid_cues"):
+        return "BUY"
+    if _contains_lexicon_entry(text, "buy_cues"):
+        return "BUY"
+    if _contains_lexicon_entry(text, "sell_cues"):
+        return "SELL"
+    return None
+
+
+def _cancellation_has_linked_offer(
+    status_evidence_lines: List[str],
+    context_snippet: Optional[str],
+) -> bool:
+    messages: Dict[int, Dict[str, Any]] = {}
+    current_number: Optional[int] = None
+    for line in (context_snippet or "").splitlines():
+        header = re.match(r"^\s*#(\d+)\s+\[[^\]]+\]\s+(.*)$", line)
+        if header and not line.startswith("    "):
+            current_number = int(header.group(1))
+            message_match = re.match(
+                r"^\s*(?:\[OWN\]\s*)?(?P<sender>[^:]+):\s*(?P<body>.*)$",
+                header.group(2),
+            )
+            messages[current_number] = {
+                "sender": (
+                    message_match.group("sender").strip().casefold()
+                    if message_match
+                    else None
+                ),
+                "body": message_match.group("body") if message_match else "",
+                "replying_to": None,
+            }
+        elif current_number is not None and line.startswith("    "):
+            continuation = line.strip()
+            if continuation.casefold().startswith("replying to:"):
+                messages[current_number]["replying_to"] = continuation[
+                    len("replying to:"):
+                ].strip()
+            else:
+                messages[current_number]["body"] += "\n" + continuation
+        else:
+            current_number = None
+
+    offer_categories = ("buy_cues", "sell_cues", "question_cues")
+
+    def is_offer_or_inquiry(message: Dict[str, Any]) -> bool:
+        return any(
+            _contains_lexicon_entry(message["body"], category)
+            for category in offer_categories
+        )
+
+    refusal_numbers = {
+        int(match.group(1))
+        for line in status_evidence_lines
+        if (match := re.match(r"#(\d+)", line)) is not None
+        and _contains_lexicon_entry(
+            _evidence_body(line),
+            "pass_or_refusal",
+        )
+    }
+    for refusal_number in refusal_numbers:
+        refusal = messages.get(refusal_number)
+        if refusal is None or refusal["sender"] is None:
+            continue
+        possible_targets = []
+        previous = messages.get(refusal_number - 1)
+        if previous is not None:
+            possible_targets.append(previous)
+        quote = refusal["replying_to"]
+        if quote:
+            normalized_quote = _normalize_lexicon_text(quote)
+            possible_targets.extend(
+                message
+                for number, message in messages.items()
+                if number < refusal_number
+                and normalized_quote
+                and normalized_quote
+                in _normalize_lexicon_text(message["body"])
+            )
+        for target in possible_targets:
+            if (
+                is_offer_or_inquiry(target)
+                and target["sender"] is not None
+                and target["sender"] != refusal["sender"]
+            ):
+                return True
+    return False
 
 
 def _evidence_check(
@@ -1664,8 +1795,14 @@ def validate_extraction(
             "error": "Extraction output must be a deal object",
             "prompt_version": PROMPT_VERSION,
         }
+    status_missing_defaulted = deal.get("status") not in EXTRACTION_STATUSES
+    deal_to_validate = dict(deal)
+    if status_missing_defaulted:
+        deal_to_validate["status"] = "UNCERTAIN"
     try:
-        validated = DealExtraction.model_validate(deal).model_dump(mode="json")
+        validated = DealExtraction.model_validate(
+            deal_to_validate
+        ).model_dump(mode="json")
     except ValidationError as error:
         return {
             "extraction_failed": True,
@@ -1676,6 +1813,8 @@ def validate_extraction(
 
     errors: List[str] = []
     warnings: List[str] = []
+    if status_missing_defaulted:
+        warnings.append("status_missing_defaulted")
 
     isin_text = validated.get("isin_text")
     if isin_text is not None and str(isin_text).strip():
@@ -1699,6 +1838,10 @@ def validate_extraction(
         context_snippet,
     )
     warnings.extend(evidence_warnings)
+    if validated.get("status") not in EXTRACTION_STATUSES:
+        validated["status"] = "UNCERTAIN"
+        if "status_missing_defaulted" not in warnings:
+            warnings.append("status_missing_defaulted")
     normalization_warnings, normalizer_needs_review = _normalize_extracted_fields(
         validated,
         context_snippet,
@@ -1708,13 +1851,28 @@ def validate_extraction(
     warnings.extend(normalization_warnings)
 
     missing_fields = _conclusion_check(validated, verified, cited_lines)
+    original_status = validated.get("status")
+    if original_status == "CANCELLED":
+        cancellation_linked = (
+            verified.get("status", False)
+            and verified.get("status_evidence", False)
+            and _cancellation_has_linked_offer(
+                cited_lines.get("status_evidence", []),
+                context_snippet,
+            )
+        )
+        if cancellation_linked:
+            validated["status"] = "CANCELLED"
+        else:
+            validated["status"] = "UNCERTAIN"
+            missing_fields.append("linked_offer_or_inquiry")
+            warnings.append("unlinked_cancellation_refusal")
     if (
         validated.get("buyer_text")
         and validated.get("seller_text")
         and validated["buyer_text"].casefold() == validated["seller_text"].casefold()
     ):
         errors.append("buyer_equals_seller")
-    original_status = validated.get("status")
     if original_status == "CONCLUDED" and missing_fields:
         validated["status"] = (
             "NEGOTIATING"

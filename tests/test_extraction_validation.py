@@ -53,6 +53,155 @@ def concluded_deal():
 
 
 class EvidenceValidationTests(unittest.TestCase):
+    def validate_direction(self, message, owner_side, buyer_text, seller_text):
+        deal = {
+            "owner_side": owner_side,
+            "buyer_text": buyer_text,
+            "seller_text": seller_text,
+            "evidence": {
+                "owner_side": ["#1"],
+                "buyer_text": ["#1"] if buyer_text else [],
+                "seller_text": ["#1"] if seller_text else [],
+            },
+        }
+        return pipeline.validate_extraction(
+            deal,
+            (
+                "Chat: Synthetic Desk\n"
+                "Type: PRIVATE\n"
+                "Date: 2026-10-20\n"
+                f"#1 [10:00:00] [OWN] Desk: {message}"
+            ),
+        )
+
+    def test_offer_requests_mean_sender_wants_to_buy(self):
+        for phrase in (
+            "offer pls",
+            "offer please",
+            "need offer",
+            "any offer?",
+            "offers?",
+        ):
+            with self.subTest(phrase=phrase):
+                result = self.validate_direction(
+                    phrase,
+                    "BUY",
+                    "Desk",
+                    None,
+                )
+                self.assertEqual(result["owner_side"], "BUY")
+                self.assertEqual(result["buyer_text"], "Desk")
+                self.assertIsNone(result["seller_text"])
+
+    def test_level_bearing_offers_mean_sender_is_selling(self):
+        for phrase in (
+            "offer at 10.08",
+            "I have an offer",
+            "10% offer",
+        ):
+            with self.subTest(phrase=phrase):
+                result = self.validate_direction(
+                    phrase,
+                    "SELL",
+                    None,
+                    "Desk",
+                )
+                self.assertEqual(result["owner_side"], "SELL")
+                self.assertIsNone(result["buyer_text"])
+                self.assertEqual(result["seller_text"], "Desk")
+
+    def test_bid_requests_mean_sender_wants_to_sell(self):
+        for phrase in ("bid pls", "bid please", "any bids?"):
+            with self.subTest(phrase=phrase):
+                result = self.validate_direction(
+                    phrase,
+                    "SELL",
+                    None,
+                    "Desk",
+                )
+                self.assertEqual(result["owner_side"], "SELL")
+                self.assertIsNone(result["buyer_text"])
+                self.assertEqual(result["seller_text"], "Desk")
+
+    def test_level_bearing_bids_mean_sender_is_buying(self):
+        for phrase in ("bid at 10.08", "I have a bid"):
+            with self.subTest(phrase=phrase):
+                result = self.validate_direction(
+                    phrase,
+                    "BUY",
+                    "Desk",
+                    None,
+                )
+                self.assertEqual(result["owner_side"], "BUY")
+                self.assertEqual(result["buyer_text"], "Desk")
+                self.assertIsNone(result["seller_text"])
+
+    def test_isin_units_settlement_without_side_keeps_parties_empty(self):
+        result = pipeline.validate_extraction(
+            {
+                "isin_text": "ZZ0000000000",
+                "quantity_text": "43 units",
+                "settlement_text": "T+1",
+                "owner_side": "UNKNOWN",
+                "buyer_text": None,
+                "seller_text": None,
+                "evidence": {
+                    "isin_text": ["#1"],
+                    "quantity_text": ["#1"],
+                    "settlement_text": ["#1"],
+                    "owner_side": ["#1"],
+                },
+            },
+            (
+                "Chat: Synthetic Desk\n"
+                "Type: PRIVATE\n"
+                "Date: 2026-10-20\n"
+                "#1 [10:00:00] [OWN] Desk: "
+                "ZZ0000000000 43 units T+1"
+            ),
+            datetime(2026, 10, 20, 10, 0),
+        )
+
+        self.assertEqual(result["owner_side"], "UNKNOWN")
+        self.assertIsNone(result["buyer_text"])
+        self.assertIsNone(result["seller_text"])
+
+    def test_missing_status_defaults_to_uncertain_with_warning(self):
+        deal = concluded_deal()
+        deal.pop("status")
+        deal["evidence"].pop("status")
+
+        result = pipeline.validate_extraction(deal, SNIPPET)
+
+        self.assertEqual(result["status"], "UNCERTAIN")
+        self.assertIn("status_missing_defaulted", result["warnings"])
+
+    def test_unrecognized_status_defaults_to_uncertain_with_warning(self):
+        deal = concluded_deal()
+        deal["status"] = "NOT_A_STATUS"
+
+        result = pipeline.validate_extraction(deal, SNIPPET)
+
+        self.assertEqual(result["status"], "UNCERTAIN")
+        self.assertIn("status_missing_defaulted", result["warnings"])
+
+    def test_valid_status_is_preserved_without_default_warning(self):
+        deal = concluded_deal()
+
+        result = pipeline.validate_extraction(deal, SNIPPET)
+
+        self.assertEqual(result["status"], "CONCLUDED")
+        self.assertNotIn("status_missing_defaulted", result["warnings"])
+
+    def test_status_rejected_by_evidence_defaults_to_uncertain(self):
+        deal = concluded_deal()
+        deal["evidence"]["status"] = ["#1"]
+
+        result = pipeline.validate_extraction(deal, SNIPPET)
+
+        self.assertEqual(result["status"], "UNCERTAIN")
+        self.assertIn("status_missing_defaulted", result["warnings"])
+
     def test_valid_conclusion_has_normalized_fields_and_verified_confidence(self):
         with patch.object(pipeline.config, "REVIEW_CONFIDENCE_THRESHOLD", 0.7):
             result = pipeline.validate_extraction(concluded_deal(), SNIPPET)
@@ -118,6 +267,74 @@ class EvidenceValidationTests(unittest.TestCase):
         result = pipeline.validate_extraction(missing_terms, SNIPPET)
         self.assertEqual(result["status"], "NEGOTIATING")
         self.assertIn("quantity_text", result["missing_fields"])
+
+    def test_cancellation_requires_refusal_as_next_message_after_offer(self):
+        snippet = (
+            "Chat: Synthetic Desk\n"
+            "Type: PRIVATE\n"
+            "Date: 2026-10-20\n"
+            "#1 [10:00:00] [OWN] Desk: Offering Synthetic GS Aug 2030 at 10.08 for 5 cr\n"
+            "#2 [10:01:00] Trader B: no requirement\n"
+        )
+        deal = concluded_deal()
+        deal["status"] = "CANCELLED"
+        deal["status_evidence"] = "no requirement"
+        deal["evidence"]["status"] = ["#2"]
+        deal["evidence"]["status_evidence"] = ["#2"]
+
+        result = pipeline.validate_extraction(deal, snippet)
+
+        self.assertEqual(result["status"], "CANCELLED")
+        self.assertEqual(result["status_evidence"], "no requirement")
+        self.assertNotIn("linked_offer_or_inquiry", result["missing_fields"])
+        self.assertNotIn("unlinked_cancellation_refusal", result["warnings"])
+
+    def test_cancellation_can_link_to_offer_through_reply_quote(self):
+        snippet = (
+            "Chat: Synthetic Desk\n"
+            "Type: PRIVATE\n"
+            "Date: 2026-10-20\n"
+            "#1 [10:00:00] [OWN] Desk: Offer Synthetic GS Aug 2030 at 10.08 for 5 cr\n"
+            "#2 [10:01:00] Trader B: Checking\n"
+            "#3 [10:02:00] Trader B: nahi\n"
+            "    replying to: Offer Synthetic GS Aug 2030 at 10.08 for 5 cr\n"
+        )
+        deal = concluded_deal()
+        deal["status"] = "CANCELLED"
+        deal["status_evidence"] = "nahi"
+        deal["evidence"]["status"] = ["#3"]
+        deal["evidence"]["status_evidence"] = ["#3"]
+
+        result = pipeline.validate_extraction(deal, snippet)
+
+        self.assertEqual(result["status"], "CANCELLED")
+        self.assertEqual(result["status_evidence"], "nahi")
+        self.assertNotIn("linked_offer_or_inquiry", result["missing_fields"])
+
+    def test_unlinked_refusal_is_uncertain_and_silence_stays_initiated(self):
+        snippet = (
+            "Chat: Synthetic Desk\n"
+            "Type: PRIVATE\n"
+            "Date: 2026-10-20\n"
+            "#1 [10:00:00] Trader B: Checking\n"
+            "#2 [10:01:00] Trader B: rehne do\n"
+            "#3 [10:02:00] [OWN] Desk: Offering Synthetic GS Aug 2030 at 10.08 for 5 cr\n"
+        )
+        deal = concluded_deal()
+        deal["status"] = "CANCELLED"
+        deal["status_evidence"] = "rehne do"
+        deal["evidence"]["status"] = ["#2"]
+        deal["evidence"]["status_evidence"] = ["#2"]
+
+        result = pipeline.validate_extraction(deal, snippet)
+        self.assertEqual(result["status"], "UNCERTAIN")
+        self.assertIn("linked_offer_or_inquiry", result["missing_fields"])
+        self.assertIn("unlinked_cancellation_refusal", result["warnings"])
+
+        silent_deal = concluded_deal()
+        silent_deal["status"] = "INITIATED"
+        silent_result = pipeline.validate_extraction(silent_deal, snippet)
+        self.assertEqual(silent_result["status"], "INITIATED")
 
     def test_buyer_seller_equality_only_errors_when_both_are_known(self):
         deal = concluded_deal()
@@ -260,6 +477,7 @@ class EvidenceValidationTests(unittest.TestCase):
         deal = concluded_deal()
         deal["ytm"] = "10.08%"
         deal["evidence"]["ytm"] = ["#2", "#9"]
+        deal["evidence"]["status"] = ["#4"]
         deal["evidence"]["status_evidence"] = ["#4"]
         deal["status_evidence"] = "closed"
         result = pipeline.validate_extraction(deal, snippet)
