@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import config
 
 DB_PATH = "bond_deals.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Exact DDL specified in requirements
 SCHEMA_SQL = """
@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS transactions (
             'INITIATED','NEGOTIATING','CONCLUDED','CANCELLED','UNCERTAIN','DISCARDED'
         )
     ),
+    identification_status             TEXT,
     created_at                          TEXT NOT NULL,
     updated_at                           TEXT NOT NULL,
     context_id                          TEXT,
@@ -109,6 +110,18 @@ CREATE TABLE IF NOT EXISTS transaction_messages (
     FOREIGN KEY (transaction_id) REFERENCES transactions (transaction_id),
     FOREIGN KEY (message_id) REFERENCES messages (message_id)
 );
+
+CREATE TABLE IF NOT EXISTS identification_audit (
+    audit_id                 TEXT PRIMARY KEY,
+    transaction_id           TEXT NOT NULL,
+    identification_status    TEXT,
+    created_at               TEXT NOT NULL,
+    FOREIGN KEY (transaction_id) REFERENCES transactions (transaction_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bonds_isin_unique_not_null
+    ON bonds (isin)
+    WHERE isin IS NOT NULL;
 """
 
 SCHEMA_VERSION_SQL = """
@@ -120,86 +133,180 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 
 def get_db_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(
+        db_path,
+        timeout=30.0,
+        isolation_level="DEFERRED",
+    )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        foreign_keys_enabled = conn.execute("PRAGMA foreign_keys").fetchone()
+        if foreign_keys_enabled is None or foreign_keys_enabled[0] != 1:
+            raise RuntimeError("SQLite foreign-key enforcement could not be enabled.")
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
+def _migration_3(conn: sqlite3.Connection) -> None:
+    transaction_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(transactions)")
+    }
+    if "source_hash" not in transaction_columns:
+        conn.execute("ALTER TABLE transactions ADD COLUMN source_hash TEXT")
+    if "deal_index" not in transaction_columns:
+        conn.execute("ALTER TABLE transactions ADD COLUMN deal_index INTEGER")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_source_context_deal
+        ON transactions (source_hash, context_id, deal_index)
+        """
+    )
+
+
+def _migration_4(conn: sqlite3.Connection) -> None:
+    existing_tables = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    if "transactions" not in existing_tables or "bonds" not in existing_tables:
+        raise RuntimeError(
+            "Cannot apply SQLite migration 4: required transactions or bonds "
+            "table is missing."
+        )
+
+    transaction_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(transactions)")
+    }
+    if "identification_status" not in transaction_columns:
+        conn.execute(
+            "ALTER TABLE transactions ADD COLUMN identification_status TEXT"
+        )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS identification_audit (
+            audit_id TEXT PRIMARY KEY,
+            transaction_id TEXT NOT NULL,
+            identification_status TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (transaction_id)
+                REFERENCES transactions (transaction_id)
+        )
+        """
+    )
+
+    duplicate_isin_groups = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM (
+            SELECT isin
+            FROM bonds
+            WHERE isin IS NOT NULL
+            GROUP BY isin
+            HAVING COUNT(*) > 1
+        )
+        """
+    ).fetchone()[0]
+    if duplicate_isin_groups:
+        raise RuntimeError(
+            "Cannot create the unique non-null ISIN index: "
+            f"{duplicate_isin_groups} duplicate ISIN group(s) exist. "
+            "No bond or transaction rows were changed; resolve duplicates "
+            "manually using the documented procedure, then retry."
+        )
+
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_bonds_isin_unique_not_null
+        ON bonds (isin)
+        WHERE isin IS NOT NULL
+        """
+    )
+
+
+MIGRATIONS = {
+    3: _migration_3,
+    4: _migration_4,
+}
+
+
 def init_db(db_path: str = DB_PATH) -> None:
-    """Initialize the current schema, refusing implicit legacy migrations."""
+    """Create a new schema or apply versioned, transactional SQLite migrations."""
     conn = get_db_connection(db_path)
     try:
         existing_tables = {
             row["name"]
             for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
             )
         }
-        conn.executescript(SCHEMA_VERSION_SQL)
+        if not existing_tables:
+            try:
+                conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_SQL)
+                conn.execute(SCHEMA_VERSION_SQL)
+                conn.execute(
+                    "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                    (SCHEMA_VERSION, datetime.now().isoformat()),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            return
+
+        if "schema_version" not in existing_tables:
+            raise RuntimeError(
+                "Database has no schema version; its existing schema is unknown. "
+                "No tables or rows were changed."
+            )
+
         version_row = conn.execute(
             "SELECT version FROM schema_version ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
-        if version_row is None and existing_tables:
+        if version_row is None:
             raise RuntimeError(
-                "Database has no schema version and may use an older schema; "
-                "run reset_db(db_path) to recreate it (development only)."
+                "Database schema_version table is empty. No tables or rows were changed."
             )
-        if version_row is not None and version_row["version"] < SCHEMA_VERSION:
-            if version_row["version"] == 2:
-                try:
-                    conn.execute("BEGIN TRANSACTION")
-                    transaction_columns = {
-                        row["name"]
-                        for row in conn.execute(
-                            "PRAGMA table_info(transactions)"
-                        )
-                    }
-                    if "source_hash" not in transaction_columns:
-                        conn.execute(
-                            "ALTER TABLE transactions ADD COLUMN source_hash TEXT"
-                        )
-                    if "deal_index" not in transaction_columns:
-                        conn.execute(
-                            "ALTER TABLE transactions ADD COLUMN deal_index INTEGER"
-                        )
-                    conn.execute(
-                        """
-                        CREATE UNIQUE INDEX IF NOT EXISTS
-                            idx_transactions_source_context_deal
-                        ON transactions (source_hash, context_id, deal_index)
-                        """
-                    )
-                    conn.execute(
-                        "UPDATE schema_version SET version = ?, applied_at = ?",
-                        (SCHEMA_VERSION, datetime.now().isoformat()),
-                    )
-                    conn.commit()
-                    version_row = conn.execute(
-                        "SELECT version FROM schema_version "
-                        "ORDER BY rowid DESC LIMIT 1"
-                    ).fetchone()
-                except Exception:
-                    conn.rollback()
-                    raise
-            else:
-                raise RuntimeError(
-                    f"Database schema version {version_row['version']} is older "
-                    f"than required version {SCHEMA_VERSION}; run reset_db(db_path) "
-                    "to recreate it (development only)."
-                )
-        if version_row is not None and version_row["version"] > SCHEMA_VERSION:
+        current_version = version_row["version"]
+        if current_version > SCHEMA_VERSION:
             raise RuntimeError(
-                f"Database schema version {version_row['version']} is newer than "
+                f"Database schema version {current_version} is newer than "
                 f"supported version {SCHEMA_VERSION}."
             )
-        conn.executescript(SCHEMA_SQL)
-        if version_row is None:
-            conn.execute(
-                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
-                (SCHEMA_VERSION, datetime.now().isoformat()),
-            )
-        conn.commit()
+
+        for target_version in range(current_version + 1, SCHEMA_VERSION + 1):
+            migration = MIGRATIONS.get(target_version)
+            if migration is None:
+                raise RuntimeError(
+                    f"No SQLite migration is available for schema version "
+                    f"{target_version}."
+                )
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                migration(conn)
+                conn.execute(
+                    "UPDATE schema_version SET version = ?, applied_at = ?",
+                    (target_version, datetime.now().isoformat()),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        if current_version == SCHEMA_VERSION:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                _migration_4(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
     finally:
         conn.close()
 
@@ -207,9 +314,9 @@ def reset_db(db_path: str = DB_PATH) -> None:
     """Drop and recreate all tables. For development databases only."""
     conn = get_db_connection(db_path)
     try:
-        conn.execute("PRAGMA foreign_keys = OFF")
         for table in (
             "transaction_messages",
+            "identification_audit",
             "transactions",
             "bonds",
             "messages",

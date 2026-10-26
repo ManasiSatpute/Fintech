@@ -25,16 +25,16 @@ Branch with the latest work: `pipeline-improvements`.
 - Partial-ISIN handling: anything that is not a full valid ISIN moves to `partial_isin_text`.
 - Yield cleanup: sign stripped, out-of-range yields (outside about 3 to 25) nulled and flagged, "ISIN - number" treated as units.
 - Extraction and database views show chat names, status and review badges, confidence, evidence, missing fields, quantities, amounts, settlement details, and report counts.
-- Last test run: **99 tests passing** (plus 15 subtests).
+- Phase 1 SQLite hardening: versioned in-place migrations, verified per-connection foreign keys, separate identification status, and a duplicate-checked partial unique ISIN index.
+- Last test run: **109 tests passing** (plus 15 subtests).
 
 **Not done yet (in order)**
 
 1. Make a closed trade reach `CONCLUDED` (see Known issues, item 1).
 2. `CANCELLED` handling for explicit refusals (see Known issues, item 2).
-3. **Prompt 11, database schema** (new statuses and fields; `/store` is blocked until this is done).
-4. Prompt 12, API behaviour (remove the 8-context cap, per-context error handling).
-5. Prompt 16, before/after comparison against the saved baseline.
-6. Primary / secondary bond identity ladder and LLM-based context assignment (the mentor's reviews, section 8).
+3. Prompt 12, API behaviour (remove the 8-context cap, per-context error handling).
+4. Prompt 16, before/after comparison against the saved baseline.
+5. Primary / secondary bond identity ladder and LLM-based context assignment (the mentor's reviews, section 8).
 
 Full details for each are in section 9.
 
@@ -145,7 +145,7 @@ python scripts\smoke_run.py data\real_chat.jsonl
 | `app.py` | FastAPI app: upload, extract, store, view data, samples |
 | `pipeline.py` | Parsing, noise tagging, relevance, grouping, snippet building, LLM call, validation |
 | `normalize.py` | Pure functions: quantity, yield, bps, settlement dates, maturity, ISIN checks |
-| `db.py` | SQLite storage (`bond_deals.db`, git-ignored). **Schema update pending (prompt 11)** |
+| `db.py` | SQLite storage (`bond_deals.db`, git-ignored) with versioned schema migrations |
 | `config.py` | All settings |
 | `lexicon.json` | Multilingual trade cues (agreement, pass, pending, relative days). Needs review by a Hindi/Marathi speaker |
 | `issuer_aliases.json` | Issuer name aliases. Add public issuer names only |
@@ -229,10 +229,11 @@ Add a unit test with synthetic line numbers (yield cited on lines 2 and 9, accep
 **B. CANCELLED for explicit refusals.**
 A refusal ("pass", "no sir", "no requirement", "nahi", "rehne do", see `lexicon.json`) in direct reply to a specific offer or inquiry (by reply link or next message in the same chat) sets that deal to CANCELLED with the refusal line as `status_evidence`. A refusal that cannot be tied to an offer stays UNCERTAIN. Silence stays INITIATED.
 
-**C. Prompt 11, database schema (`db.py`), in two passes.**
-- Pass 1: `schema_version` table and a development reset helper; `messages` gets `chat_key`, `chat_name`, `chat_type`, `direction`, `is_own`, `is_media`, `media_kind`, `replying_to_text`, `noise_label`, hashed sender id; insert with `INSERT OR IGNORE` on the stable `message_id`.
-- Pass 2: `transactions` allows INITIATED / NEGOTIATING / CONCLUDED / CANCELLED / UNCERTAIN, nullable or OTHER settlement, plus `context_id`, `chat_key`, `owner_side`, `buyer_text`, `seller_text`, `quantity_text`, `amount_inr`, `units_assumed`, `ytm_is_two_way`, `settlement_text`, `maturity_text`, `maturity_ym`, `partial_isin_text`, `rfq_id`, `package_note`, `evidence_json`, `missing_fields_json`, `confidence`, `needs_review`, `prompt_version`, `model_name`; new `transaction_messages` join table (one broadcast can belong to several deals). Update `persist_upload` and `fetch_database_data`, then remove the "cannot store the new extraction format" guard in `app.py`.
-- SQLite cannot alter CHECK constraints, so recreate the tables (delete any old `bond_deals.db` first). Leave the bond identity / dedupe logic alone; it is being reworked (item I).
+**C. Phase 1 SQLite database hardening (`db.py`, implemented).**
+- Schema version 4 migrates existing version 3 databases in place; version 2 databases pass through the existing version 3 migration first. Migrations are transactional and do not replace the database or delete rows.
+- Foreign-key enforcement is enabled and verified on every project database connection. `transactions.identification_status` is independent of the existing trade `status`; `transactions.bond_id` remains required so existing persistence and identity behavior do not change.
+- A unique partial index covers non-null `bonds.isin`. If duplicate ISIN groups exist, migration stops and rolls back without changing rows. Back up the database, review duplicates locally, and resolve each manually: correct erroneous ISINs only from an authoritative source; for confirmed duplicate records representing the same bond, reassign dependent transactions to a reviewed canonical bond ID and set the duplicate row's ISIN to null while retaining the row. Verify foreign keys and the absence of duplicate non-null ISINs, then rerun application initialization. Never delete the duplicate bond rows as an automatic migration step.
+- `identification_audit` is a minimal future-compatible table; detailed audit fields and write behavior are deferred to Phase 5. Bond identity / dedupe logic remains unchanged.
 
 **D. Prompt 12, `app.py`.** Remove the top-8 cap and ISIN-first sorting (process all contexts chronologically). Wrap each context in its own try/except and collect errors with the raw model output. `/extract` returns a full report (messages, media, system, skipped, contexts, skipped_low_relevance, processed, failed, deals by status, `needs_review` count, token usage). Add a TTL for in-memory upload sessions. Pass chat info and message ids through so `/store` links messages through the join table.
 
