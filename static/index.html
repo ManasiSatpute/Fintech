@@ -420,6 +420,19 @@
       showStatus(
         "Filtering noise and extracting trade details..."
       );
+      const extractionStartedAt = Date.now();
+      let extractionTimer = window.setInterval(() => {
+        const statusText = document.querySelector(
+          "#statusMsg .loading-pulse"
+        );
+        if (statusText) {
+          const elapsedSeconds = Math.floor(
+            (Date.now() - extractionStartedAt) / 1000
+          );
+          statusText.textContent =
+            `Filtering noise and extracting trade details... (${elapsedSeconds}s elapsed)`;
+        }
+      }, 1000);
 
       try {
 
@@ -429,6 +442,8 @@
             method: "POST"
           }
         );
+        window.clearInterval(extractionTimer);
+        extractionTimer = null;
 
         if (!extractRes.ok) {
           throw new Error(await extractRes.text());
@@ -717,6 +732,9 @@
 
       } catch (err) {
 
+        if (extractionTimer !== null) {
+          window.clearInterval(extractionTimer);
+        }
         removeStatus();
 
         appendMessage(`

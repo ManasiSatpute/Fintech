@@ -1,3 +1,5 @@
+import asyncio
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -23,6 +25,48 @@ def context(context_id, start, snippet):
 class AppExtractionTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         app.UPLOAD_SESSIONS.clear()
+
+    async def test_llm_call_does_not_block_the_async_event_loop(self):
+        app._store_upload_session("threaded-upload", {
+            "upload_id": "threaded-upload",
+            "parsed_messages": [],
+            "parse_report": {},
+        })
+        llm_finished = threading.Event()
+        loop_ran_during_llm_call = []
+
+        def blocking_llm(_snippet):
+            llm_finished.wait(timeout=1)
+            llm_finished.set()
+            return (
+                {"deals": [], "prompt_version": "test"},
+                {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            )
+
+        async def keep_event_loop_responsive():
+            await asyncio.sleep(0.05)
+            loop_ran_during_llm_call.append(not llm_finished.is_set())
+            llm_finished.set()
+
+        with (
+            patch.object(
+                app.pipeline,
+                "group_into_trade_contexts",
+                return_value=([context("slow", "2026-01-01", "snippet")], []),
+            ),
+            patch.object(
+                app.pipeline,
+                "call_llm_extraction",
+                side_effect=blocking_llm,
+            ),
+            patch.object(app.pipeline, "get_model_context_length", return_value=100),
+        ):
+            await asyncio.gather(
+                app.extract_trades("threaded-upload"),
+                keep_event_loop_responsive(),
+            )
+
+        self.assertEqual(loop_ran_during_llm_call, [True])
 
     async def test_context_failures_are_isolated_and_reported(self):
         upload_id = "synthetic-upload"

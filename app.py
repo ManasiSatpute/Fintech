@@ -20,6 +20,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 import config
 import db
@@ -172,8 +173,9 @@ async def extract_trades(upload_id: str):
             "total_tokens": 0,
         }
         try:
-            extraction_result, tokens = pipeline.call_llm_extraction(
-                ctx["snippet_text"]
+            extraction_result, tokens = await run_in_threadpool(
+                pipeline.call_llm_extraction,
+                ctx["snippet_text"],
             )
             prompt_tk = tokens.get("prompt_tokens", 0)
             compl_tk = tokens.get("completion_tokens", 0)

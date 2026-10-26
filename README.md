@@ -114,7 +114,7 @@ Writes a timestamped JSON report to `baseline/` (git-ignored): message counts by
 Run a concise extraction smoke report with aggregate counts only:
 
 ```powershell
-python scripts\smoke_run.py path\to\chat_export.jsonl
+python scripts\smoke_run.py data\real_chat.jsonl
 ```
 
 ---
