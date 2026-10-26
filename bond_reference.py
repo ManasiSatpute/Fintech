@@ -92,6 +92,11 @@ def _parse_maturity_date(value: str) -> Optional[date]:
     raise ValueError("invalid_maturity_date")
 
 
+def parse_reference_maturity_date(value: str) -> Optional[date]:
+    """Parse a non-empty maturity value using the reference CSV's date formats."""
+    return _parse_maturity_date(value)
+
+
 def _decode_csv(raw_bytes: bytes) -> Tuple[str, str]:
     for encoding in ("utf-8-sig", "cp1252"):
         try:

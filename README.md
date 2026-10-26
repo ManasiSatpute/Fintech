@@ -28,7 +28,8 @@ Branch with the latest work: `pipeline-improvements`.
 - Phase 1 SQLite hardening: versioned in-place migrations, verified per-connection foreign keys, separate identification status, and a duplicate-checked partial unique ISIN index.
 - Phase 2 bond reference index: a configurable external CSV is loaded into immutable in-memory ISIN and issuer indexes; the extraction pipeline does not use it yet.
 - Phase 3 source-based ISIN extraction: original message evidence, normalized candidates, structure and checksum validation; no pipeline integration or bond matching.
-- Last test run: **134 tests passing** (plus 20 subtests).
+- Phase 4 standalone bond matching: source-supported exact ISIN first, then exact normalized issuer plus evidenced corroborating details; ambiguous or conflicting results never select arbitrarily.
+- Last test run: **153 tests passing** (plus 22 subtests).
 
 **Not done yet (in order)**
 
@@ -36,7 +37,7 @@ Branch with the latest work: `pipeline-improvements`.
 2. `CANCELLED` handling for explicit refusals (see Known issues, item 2).
 3. Prompt 12, API behaviour (remove the 8-context cap, per-context error handling).
 4. Prompt 16, before/after comparison against the saved baseline.
-5. Primary / secondary bond identity ladder and LLM-based context assignment (the mentor's reviews, section 8).
+5. LLM-based context assignment and carrying resolved identity across messages (the mentor's reviews, section 8).
 
 Full details for each are in section 9.
 
@@ -250,6 +251,13 @@ A refusal ("pass", "no sir", "no requirement", "nahi", "rehne do", see `lexicon.
 - LLM candidates are checked against the original message and, if supplied, only explicitly linked messages with evidence referring back to the original message. Callers must not pass an unfiltered chat window.
 - This module does not perform bond matching, persist records, or integrate into extraction.
 
+**Phase 4 primary and secondary bond matching (`bond_matching.py`, implemented).**
+- A single source-supported, checksum-valid Phase 3 ISIN is looked up exactly in the Phase 2 index. Results distinguish an exact primary match from a valid ISIN absent from the reference.
+- Secondary matching requires an exact normalized issuer key and at least one source-supported maturity, coupon/rate, or exact security-description detail. All comparable supplied fields must agree; unknown reference fields do not corroborate a candidate. Fuzzy issuer similarity and issuer-only matches are not accepted.
+- Multiple candidates are returned as ambiguous. If primary and unique secondary evidence point to different securities, the result is a conflict and selects neither. Invalid, checksum-failing, unsupported, or unrelated-message identifier evidence is never used for exact lookup.
+- The reference data has no credit-rating column. Alias-to-legal-name resolution is not applied because the current alias file does not establish exact mappings to reference issuer records.
+- This remains an independent matching utility: no extraction-pipeline integration, persistence, audit writes, or schema changes.
+
 **E. Prompt 12, `app.py`.** Remove the top-8 cap and ISIN-first sorting (process all contexts chronologically). Wrap each context in its own try/except and collect errors with the raw model output. `/extract` returns a full report (messages, media, system, skipped, contexts, skipped_low_relevance, processed, failed, deals by status, `needs_review` count, token usage). Add a TTL for in-memory upload sessions. Pass chat info and message ids through so `/store` links messages through the join table.
 
 **F. Prompt 13, `privacy.py` (done).** Mask phones, `@numeric` mentions, URLs, emails, bank or account fragments and sender numbers before the model. Person names are optional (`MASK_PERSON_NAMES`, default false). Do **not** mask ISINs, yields, quantities, dates or RFQ ids. Keep an in-memory placeholder map and restore model results locally after validation.
@@ -260,9 +268,9 @@ A refusal ("pass", "no sir", "no requirement", "nahi", "rehne do", see `lexicon.
 
 **I. Prompt 16, before/after.** Re-run the baseline script on the same real file with the same model and produce a side-by-side table (contexts, dropped or skipped messages, contexts sent to the model, deals by status, `needs_review`). List messages that were previously dropped and are now kept.
 
-**J. Primary / secondary bond identity and LLM context assignment (mentor reviews).**
+**J. LLM context assignment and identity carry-forward (mentor reviews).**
 - Context assignment: for each new message give the LLM the active contexts (short cards: bond details so far plus last few messages) and ask: same context / new context / not trade-related, with a confidence. Time gap becomes a hint only. Low confidence goes to review. A multi-bond message updates several contexts. Keep the assigner behind the `assign_contexts` function in `pipeline.py`.
-- Identity ladder: validated ISIN, then partial ISIN, then structured name, then issuer plus maturity plus coupon plus rating (via `issuer_aliases.json`). Output levels: ISIN-confirmed, uniquely resolved by secondary details, partial, ambiguous (several candidates; never guess), unknown. Carry identity forward within a context so later "Bond Unspecified" messages inherit it. The same bond can appear under different issuer names in different chats, with the same ISIN.
+- Identity carry-forward: build on Phase 4's source-grounded primary and secondary match results; later carry confirmed identity within a context so later "Bond Unspecified" messages inherit it. Partial-identifier matching and safe alias-to-legal-name mappings need separate definition before integration. The same bond can appear under different issuer names in different chats, with the same ISIN.
 - Cross-chat linking of one deal (broadcast, negotiation, internal dealing, ops) is a later step above per-chat contexts.
 
 ---
