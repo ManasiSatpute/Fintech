@@ -11,7 +11,7 @@ Branch with the latest work: `pipeline-improvements`.
 
 ## 1. Where the project stands
 
-**Done (prompts 0 to 10 and 13, plus follow-up fixes)**
+**Done (prompts 0 to 10 and 13 to 14, plus follow-up fixes)**
 
 - Central settings in `config.py` (every tunable overridable by environment variable).
 - Parser with stable chat identity (`chat_key` from group id / counterpart number), stable message ids, day-first/month-first date detection, no silent `datetime.now()` fallback, reply links and media kept.
@@ -24,7 +24,7 @@ Branch with the latest work: `pipeline-improvements`.
 - New extraction schema (several deals per window, evidence line numbers, nothing defaulted) and validation (evidence check, stricter CONCLUDED rule, confidence, `needs_review`).
 - Partial-ISIN handling: anything that is not a full valid ISIN moves to `partial_isin_text`.
 - Yield cleanup: sign stripped, out-of-range yields (outside about 3 to 25) nulled and flagged, "ISIN - number" treated as units.
-- Last test run: **88 tests passing** (plus 13 subtests).
+- Last test run: **99 tests passing** (plus 15 subtests).
 
 **Not done yet (in order)**
 
@@ -32,10 +32,9 @@ Branch with the latest work: `pipeline-improvements`.
 2. `CANCELLED` handling for explicit refusals (see Known issues, item 2).
 3. **Prompt 11, database schema** (new statuses and fields; `/store` is blocked until this is done).
 4. Prompt 12, API behaviour (remove the 8-context cap, per-context error handling).
-5. Prompt 14, fuller offline test suite and `scripts/smoke_run.py`.
-6. Prompt 15, UI updates.
-7. Prompt 16, before/after comparison against the saved baseline.
-8. Primary / secondary bond identity ladder and LLM-based context assignment (the mentor's reviews, section 8).
+5. Prompt 15, UI updates.
+6. Prompt 16, before/after comparison against the saved baseline.
+7. Primary / secondary bond identity ladder and LLM-based context assignment (the mentor's reviews, section 8).
 
 Full details for each are in section 9.
 
@@ -111,6 +110,12 @@ python scripts\baseline_report.py data\real_chat.jsonl
 ```
 
 Writes a timestamped JSON report to `baseline/` (git-ignored): message counts by chat, system-filter drops, windows, relevant windows, contexts sent to the model, contexts cut off by the cap, and each deal's raw model output next to its validated version. Falls back to a mock model (and says so in `llm_mode`) if Ollama is unreachable. A mock-mode report is not a valid baseline.
+
+Run a concise extraction smoke report with aggregate counts only:
+
+```powershell
+python scripts\smoke_run.py path\to\chat_export.jsonl
+```
 
 ---
 
@@ -233,7 +238,7 @@ A refusal ("pass", "no sir", "no requirement", "nahi", "rehne do", see `lexicon.
 
 **E. Prompt 13, `privacy.py` (done).** Mask phones, `@numeric` mentions, URLs, emails, bank or account fragments and sender numbers before the model. Person names are optional (`MASK_PERSON_NAMES`, default false). Do **not** mask ISINs, yields, quantities, dates or RFQ ids. Keep an in-memory placeholder map and restore model results locally after validation.
 
-**F. Prompt 14, tests and `scripts/smoke_run.py`.** Offline tests with a mocked LLM and synthetic fixtures (never real data). `smoke_run.py` prints counts only: messages, chats, skipped, media, contexts, reply-linked, unresolved replies, `skipped_low_relevance`, deals by status, `needs_review`, warnings by type.
+**F. Prompt 14, tests and `scripts/smoke_run.py` (done).** Offline tests with a mocked LLM and synthetic fixtures (never real data). `smoke_run.py` follows the `/extract` pipeline and prints aggregate counts only: messages, chats, skipped, media, contexts, reply-linked, unresolved replies, `skipped_low_relevance`, deals by status, `needs_review`, warnings by type, and token/context-window totals.
 
 **G. Prompt 15, UI (`static/`).** Show chat name, status badges for all statuses, `needs_review` and confidence, missing fields, evidence line numbers, quantity as said and as amount, settlement text and date, partial ISIN, warnings. Show units labelled "Units".
 
