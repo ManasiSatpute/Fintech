@@ -53,6 +53,22 @@ def concluded_deal():
 
 
 class EvidenceValidationTests(unittest.TestCase):
+    def validate_price(self, price, message):
+        snippet = (
+            "Chat: Synthetic Desk\n"
+            "Type: GROUP\n"
+            "Date: 2026-10-20\n"
+            f"#1 [10:00:00] Sender: {message}"
+        )
+        return pipeline.validate_extraction(
+            {
+                "price": price,
+                "status": "INITIATED",
+                "evidence": {"price": ["#1"]},
+            },
+            snippet,
+        )
+
     def validate_direction(self, message, owner_side, buyer_text, seller_text):
         deal = {
             "owner_side": owner_side,
@@ -302,6 +318,30 @@ class EvidenceValidationTests(unittest.TestCase):
         result = pipeline.validate_extraction(deal, SNIPPET)
         self.assertIsNone(result["ytm"])
         self.assertIn("unsupported_ytm", result["warnings"])
+
+    def test_yield_only_number_is_not_valid_price_evidence(self):
+        result = self.validate_price(10.08, "YTM 10.08%")
+
+        self.assertIsNone(result["price"])
+        self.assertIn("unsupported_price", result["warnings"])
+
+    def test_coupon_only_number_is_not_valid_price_evidence(self):
+        result = self.validate_price(8.5, "Coupon 8.50%")
+
+        self.assertIsNone(result["price"])
+        self.assertIn("unsupported_price", result["warnings"])
+
+    def test_trade_amount_only_number_is_not_valid_price_evidence(self):
+        result = self.validate_price(5, "Trade amount 5 Cr")
+
+        self.assertIsNone(result["price"])
+        self.assertIn("unsupported_price", result["warnings"])
+
+    def test_explicit_clean_price_is_valid_price_evidence(self):
+        result = self.validate_price(99.5, "Clean price: 99.50")
+
+        self.assertEqual(result["price"], 99.5)
+        self.assertNotIn("unsupported_price", result["warnings"])
 
     def test_conclusion_requires_later_acceptance_and_key_terms(self):
         deal = concluded_deal()

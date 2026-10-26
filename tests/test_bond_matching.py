@@ -253,6 +253,30 @@ class BondMatchingTests(unittest.TestCase):
         self.assertEqual(result.raw_issuer_text, "  synthetic   issuer ")
         self.assertEqual(result.normalized_issuer_key, "synthetic issuer")
 
+    def test_primary_isin_and_source_issuer_contradiction_select_neither(self):
+        index = self.reference_index()
+        text = "US0378331005 Synthetic Other"
+        result = match_bond(
+            BondMatchRequest(
+                trade_message_id="trade-1",
+                isin_result=extract_isin_from_message(text, "trade-1"),
+                raw_issuer_text="Synthetic Other",
+                issuer_evidence=self.evidence(
+                    text,
+                    "Synthetic Other",
+                    "issuer",
+                ),
+            ),
+            index,
+        )
+
+        self.assertEqual(result.status, BondMatchStatus.CONFLICTING_EVIDENCE)
+        self.assertIsNone(result.matched_reference)
+        self.assertEqual(
+            result.candidate_references[0].normalized_isin,
+            "US0378331005",
+        )
+
     def test_exact_issuer_without_corroboration_does_not_resolve(self):
         index = self.reference_index()
         text = "Synthetic Issuer"

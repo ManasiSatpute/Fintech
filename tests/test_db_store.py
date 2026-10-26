@@ -92,7 +92,7 @@ class DatabaseStoreTests(unittest.TestCase):
 
     def test_all_statuses_store_and_broadcast_message_links_to_multiple_deals(self):
         deals = self.deals()
-        self.persist(deals)
+        counts = self.persist(deals)
 
         conn = db.get_db_connection(self.db_path)
         try:
@@ -109,6 +109,7 @@ class DatabaseStoreTests(unittest.TestCase):
 
         self.assertEqual(statuses, set(STATUSES))
         self.assertEqual(links_for_message, len(STATUSES))
+        self.assertEqual(len(counts["transaction_ids"]), len(STATUSES))
 
     def test_null_fields_store_and_fetch_returns_new_fields(self):
         deal = self.deals()[0]
@@ -146,6 +147,22 @@ class DatabaseStoreTests(unittest.TestCase):
         self.assertEqual(
             json.loads(stored["missing_fields_json"]),
             ["synthetic_field"],
+        )
+
+    def test_message_rows_expose_all_linked_transaction_ids(self):
+        self.persist([self.deals()[0], self.deals()[1]])
+
+        stored = db.fetch_database_data(self.db_path)
+
+        linked_message = next(
+            message
+            for message in stored["messages"]
+            if message["message_id"] == self.message["message_id"]
+        )
+        self.assertEqual(len(linked_message["transaction_ids"]), 2)
+        self.assertTrue(
+            all(isinstance(transaction_id, str)
+                for transaction_id in linked_message["transaction_ids"])
         )
 
     def test_data_response_exposes_trade_review_and_settlement_fields(self):
@@ -210,6 +227,34 @@ class DatabaseStoreTests(unittest.TestCase):
 
         self.assertIsNone(transaction["bond_id"])
         self.assertEqual(transaction_count, 1)
+        self.assertEqual(bond_count, 0)
+
+    def test_phase_six_deferred_upload_does_not_link_extracted_identity(self):
+        deal = self.deals()[0]
+        deal["bond_identity_text"] = "Synthetic extracted bond name"
+        deal["isin_text"] = "US0378331005"
+        db.persist_upload(
+            db_path=self.db_path,
+            chat_id="synthetic-upload",
+            parsed_messages=[self.message],
+            validated_deals=[deal],
+            context_message_maps={
+                deal["context_id"]: {"#1": self.message["message_id"]}
+            },
+            source_hash="synthetic-deferred-source",
+            defer_bond_creation=True,
+        )
+
+        conn = db.get_db_connection(self.db_path)
+        try:
+            transaction = conn.execute(
+                "SELECT bond_id FROM transactions"
+            ).fetchone()
+            bond_count = conn.execute("SELECT COUNT(*) FROM bonds").fetchone()[0]
+        finally:
+            conn.close()
+
+        self.assertIsNone(transaction["bond_id"])
         self.assertEqual(bond_count, 0)
 
     def test_mon_vd_stores_other_with_known_date(self):

@@ -263,7 +263,38 @@ A refusal ("pass", "no sir", "no requirement", "nahi", "rehne do", see `lexicon.
 - `persist_identification_result()` accepts a Phase 4 result and persists the status, method, explanation, candidate references and source evidence in one transaction. Only unique primary ISIN and secondary issuer matches can create or link an authoritative reference bond.
 - No-match, ambiguous, conflicting, invalid or unsupported outcomes do not create a bond link. Existing non-placeholder bond links are not overwritten by a conflicting decision.
 - Identical decisions for the same transaction share a deterministic audit key and do not create duplicate audit rows. A failed audit write rolls back bond and transaction changes.
-- `persist_upload()` leaves `bond_id` null when extraction supplies no bond identity instead of creating an `UNKNOWN` placeholder. The matcher and its persistence API are not wired into the application pipeline.
+- `persist_upload()` supports deferred bond creation so Phase 6 can leave transactions unresolved rather than creating an `UNKNOWN` placeholder. Phase 5 introduced the persistence API; Phase 6 below wires it into the application flow.
+
+**Phase 6 application integration (`pipeline.py`, `app.py`, `static/`, implemented).**
+- Each validated extracted deal is matched using only original source messages cited by that deal's identity/issuer/term evidence. ISIN candidates are extracted and validated from those messages; unsupported identifiers and multiple candidates are not selected.
+- The configured reference index is loaded through its process cache. Missing/invalid reference data is surfaced as `reference_unavailable` while extraction remains available for review.
+- `/store` persists messages, transactions, links, reference bonds and identification audits in one SQLite transaction. A failed identification write rolls back the upload writes as well. Only unique supported matches create/link a reference bond; other outcomes remain unlinked and are audited. Repeated stores use stable transaction IDs and idempotent audit decisions; changed results on an already-stored upload are skipped and reported in the `identification_skipped` response count rather than applied to an existing transaction.
+- The extraction view displays match status/reason and the transaction view displays persisted identification status. Message rows include all linked transaction IDs from the join table.
+- Clean price is accepted only when its cited source line explicitly labels the value as a price; yield, coupon and amount are never used to calculate or validate it.
+
+**Recovering uploads partially identified by an earlier Phase 6 version.**
+- Earlier versions committed upload transactions before attempting each identification write. A failed later identification write could therefore leave a stored upload with null identification statuses or missing matching audit rows. Current retries detect any existing transaction with the source hash and intentionally skip the whole upload; they do not repair that historical state.
+- To identify affected rows, run this read-only query against a database backup or an approved read-only connection:
+  ```sql
+  SELECT source_hash,
+         COUNT(*) AS transaction_count,
+         SUM(CASE
+               WHEN t.identification_status IS NULL
+                 OR NOT EXISTS (
+                   SELECT 1
+                   FROM identification_audit a
+                   WHERE a.transaction_id = t.transaction_id
+                     AND a.identification_status = t.identification_status
+                 )
+               THEN 1 ELSE 0
+             END) AS transactions_missing_matching_audit
+  FROM transactions t
+  WHERE source_hash IS NOT NULL
+  GROUP BY source_hash
+  HAVING transactions_missing_matching_audit > 0;
+  ```
+- This query detects existing transactions with no identification status or no audit row matching that status. It cannot detect transactions that were never inserted because the database has no upload manifest recording the expected transaction IDs.
+- For recovery, first make and verify a database backup. Re-process the original upload with the current extraction code in an isolated database and compare its deterministic transaction IDs and source evidence with the affected stored rows. Do not use `update_existing=True` as an automatic repair. Apply a reviewed missing result only to its verified transaction, using the normal identification persistence API after confirming that its bond link is null and no prior audit exists. If a bond link or any prior audit exists, stop for manual review. Never delete audit records or replace an established link as part of recovery.
 
 **E. Prompt 12, `app.py`.** Remove the top-8 cap and ISIN-first sorting (process all contexts chronologically). Wrap each context in its own try/except and collect errors with the raw model output. `/extract` returns a full report (messages, media, system, skipped, contexts, skipped_low_relevance, processed, failed, deals by status, `needs_review` count, token usage). Add a TTL for in-memory upload sessions. Pass chat info and message ids through so `/store` links messages through the join table.
 

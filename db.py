@@ -600,6 +600,44 @@ def _deterministic_transaction_id(
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
+def _transaction_ids_for_deals(
+    source_hash: Optional[str],
+    deals: List[Dict[str, Any]],
+    parsed_messages: List[Dict[str, Any]],
+) -> List[str]:
+    context_deal_indexes: Dict[str, int] = {}
+    transaction_ids = []
+    for deal in deals:
+        stable_context_id = _context_identity(deal, parsed_messages)
+        deal_index = context_deal_indexes.get(stable_context_id, 0)
+        context_deal_indexes[stable_context_id] = deal_index + 1
+        transaction_ids.append(
+            _deterministic_transaction_id(
+                source_hash,
+                stable_context_id,
+                deal_index,
+            )
+        )
+    return transaction_ids
+
+
+def _identification_status_counts(
+    conn: sqlite3.Connection,
+    transaction_ids: List[str],
+) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for transaction_id in transaction_ids:
+        row = conn.execute(
+            "SELECT identification_status FROM transactions "
+            "WHERE transaction_id = ?",
+            (transaction_id,),
+        ).fetchone()
+        if row is not None and row["identification_status"]:
+            status = row["identification_status"]
+            counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
 def persist_upload(
     db_path: str,
     chat_id: str,
@@ -610,10 +648,28 @@ def persist_upload(
     model_name: Optional[str] = None,
     source_hash: Optional[str] = None,
     update_existing: bool = False,
+    defer_bond_creation: bool = False,
+    identification_results: Optional[List[BondMatchResult]] = None,
 ) -> Dict[str, Any]:
     """
-    Persist all messages, distinct bonds, transactions, and deal/message links.
+    Persist an upload and its identification results atomically.
     """
+    valid_deals = [
+        deal for deal in validated_deals if not deal.get("extraction_failed")
+    ]
+    if identification_results is not None:
+        if len(identification_results) != len(valid_deals):
+            raise ValueError(
+                "Identification results must match the non-failed deals."
+            )
+        if any(
+            not isinstance(result, BondMatchResult)
+            for result in identification_results
+        ):
+            raise TypeError(
+                "Every identification result must be a BondMatchResult."
+            )
+
     init_db(db_path)
     conn = get_db_connection(db_path)
 
@@ -623,12 +679,11 @@ def persist_upload(
     transactions_stored = 0
     transactions_updated = 0
     transactions_skipped = 0
+    identification_write_allowed = []
+    identification_skipped = 0
 
     try:
         conn.execute("BEGIN TRANSACTION;")
-        valid_deals = [
-            deal for deal in validated_deals if not deal.get("extraction_failed")
-        ]
         if source_hash is not None:
             existing_source_rows = conn.execute(
                 "SELECT COUNT(*) FROM transactions WHERE source_hash = ?",
@@ -644,6 +699,20 @@ def persist_upload(
                     )
                 }
                 messages_already_present = len(existing_message_ids)
+                transaction_ids = _transaction_ids_for_deals(
+                    source_hash,
+                    valid_deals,
+                    parsed_messages,
+                )
+                identification_by_status = _identification_status_counts(
+                    conn,
+                    transaction_ids,
+                )
+                identification_skipped = (
+                    len(identification_results)
+                    if identification_results is not None
+                    else 0
+                )
                 conn.commit()
                 return {
                     "already_stored": True,
@@ -656,6 +725,9 @@ def persist_upload(
                     "transactions_updated": 0,
                     "transactions_skipped": len(valid_deals),
                     "transactions_stored": 0,
+                    "transaction_ids": transaction_ids,
+                    "identification_by_status": identification_by_status,
+                    "identification_skipped": identification_skipped,
                 }
 
         existing_message_ids = {
@@ -672,6 +744,7 @@ def persist_upload(
         # TODO: Replace upload-time bond identity resolution with explicit match persistence.
         now_iso = datetime.now().isoformat()
         context_deal_indexes: Dict[str, int] = {}
+        transaction_ids = []
 
         for deal in validated_deals:
             if deal.get("extraction_failed"):
@@ -685,10 +758,15 @@ def persist_upload(
                 stable_context_id,
                 deal_idx,
             )
+            transaction_ids.append(tx_id)
             existing_transaction = conn.execute(
                 "SELECT transaction_id FROM transactions WHERE transaction_id = ?",
                 (tx_id,),
             ).fetchone()
+            can_persist_identification = (
+                not existing_transaction or update_existing
+            )
+            identification_write_allowed.append(can_persist_identification)
             if existing_transaction and not update_existing:
                 transactions_skipped += 1
                 continue
@@ -707,15 +785,18 @@ def persist_upload(
             if identity_type not in ('ISIN', 'CUSIP', 'SERIES', 'NAME_ONLY', 'UNKNOWN'):
                 identity_type = "UNKNOWN"
 
-            # Check if bond already exists
             existing_bond = None
-            if isin:
+            if not defer_bond_creation and isin:
                 cur = conn.execute("SELECT bond_id FROM bonds WHERE isin = ?", (isin,))
                 row = cur.fetchone()
                 if row:
                     existing_bond = row["bond_id"]
 
-            if not existing_bond and bond_identity:
+            if (
+                not defer_bond_creation
+                and not existing_bond
+                and bond_identity
+            ):
                 cur = conn.execute("SELECT bond_id FROM bonds WHERE bond_identity = ?", (bond_identity,))
                 row = cur.fetchone()
                 if row:
@@ -723,6 +804,8 @@ def persist_upload(
 
             if existing_bond:
                 bond_id = existing_bond
+            elif defer_bond_creation:
+                bond_id = None
             elif bond_identity:
                 bond_id = str(uuid.uuid4())
                 conn.execute(
@@ -887,6 +970,8 @@ def persist_upload(
                         "needs_review",
                     }
                 ]
+                if defer_bond_creation:
+                    update_columns.remove("bond_id")
                 conn.execute(
                     "UPDATE transactions SET "
                     + ", ".join(f"{column} = ?" for column in update_columns)
@@ -945,6 +1030,27 @@ def persist_upload(
                 [(tx_id, message_id) for message_id in linked_message_ids],
             )
 
+        if identification_results is not None:
+            for transaction_id, result, can_persist in zip(
+                transaction_ids,
+                identification_results,
+                identification_write_allowed,
+            ):
+                if can_persist:
+                    persist_identification_result(
+                        db_path,
+                        transaction_id,
+                        result,
+                        conn=conn,
+                    )
+                else:
+                    identification_skipped += 1
+
+        identification_by_status = (
+            _identification_status_counts(conn, transaction_ids)
+            if identification_results is not None
+            else {}
+        )
         conn.commit()
         return {
             "already_stored": False,
@@ -960,6 +1066,9 @@ def persist_upload(
             "transactions_updated": transactions_updated,
             "transactions_skipped": transactions_skipped,
             "transactions_stored": transactions_stored + transactions_updated,
+            "transaction_ids": transaction_ids,
+            "identification_by_status": identification_by_status,
+            "identification_skipped": identification_skipped,
         }
 
     except Exception:
@@ -1084,6 +1193,7 @@ def persist_identification_result(
     db_path: str,
     transaction_id: str,
     result: BondMatchResult,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> Dict[str, Any]:
     """Persist one Phase 4 decision atomically without inventing a bond."""
     if not isinstance(result, BondMatchResult):
@@ -1141,17 +1251,28 @@ def persist_identification_result(
         ).encode("utf-8")
     ).hexdigest()
 
-    conn = get_db_connection(db_path)
+    owns_connection = conn is None
+    connection = conn if conn is not None else get_db_connection(db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        transaction = conn.execute(
-            "SELECT bond_id FROM transactions WHERE transaction_id = ?",
+        if owns_connection:
+            connection.execute("BEGIN IMMEDIATE")
+        elif not connection.in_transaction:
+            raise RuntimeError(
+                "A caller-owned connection must already be in a transaction."
+            )
+        transaction = connection.execute(
+            """
+            SELECT bond_id, identification_status
+            FROM transactions
+            WHERE transaction_id = ?
+            """,
             (transaction_id,),
         ).fetchone()
         if transaction is None:
             raise ValueError(f"Transaction {transaction_id!r} does not exist.")
 
         current_bond_id = transaction["bond_id"]
+        previous_status = transaction["identification_status"]
         target_bond_id = current_bond_id
         if authorized:
             normalized_isin = matched_reference.normalized_isin
@@ -1159,7 +1280,7 @@ def persist_identification_result(
                 raise ValueError(
                     "A uniquely matched reference must have a normalized ISIN."
                 )
-            bond = conn.execute(
+            bond = connection.execute(
                 "SELECT bond_id FROM bonds WHERE isin = ?",
                 (normalized_isin,),
             ).fetchone()
@@ -1179,7 +1300,7 @@ def persist_identification_result(
                 else:
                     coupon_rate = None
                 target_bond_id = str(uuid.uuid4())
-                conn.execute(
+                connection.execute(
                     """
                     INSERT INTO bonds (
                         bond_id, isin, bond_identity, identity_type, issuer_name,
@@ -1201,7 +1322,15 @@ def persist_identification_result(
                 target_bond_id = bond["bond_id"]
 
             if current_bond_id and current_bond_id != target_bond_id:
-                current_bond = conn.execute(
+                if previous_status in {
+                    BondMatchStatus.PRIMARY_ISIN_MATCH.value,
+                    BondMatchStatus.SECONDARY_ISSUER_MATCH.value,
+                }:
+                    raise ValueError(
+                        "The transaction already has an identified bond link; "
+                        "a different result requires manual review."
+                    )
+                current_bond = connection.execute(
                     """
                     SELECT isin, identity_type
                     FROM bonds
@@ -1209,29 +1338,42 @@ def persist_identification_result(
                     """,
                     (current_bond_id,),
                 ).fetchone()
-                is_unresolved_placeholder = (
+                is_unresolved_link = (
                     current_bond is not None
                     and current_bond["isin"] is None
-                    and current_bond["identity_type"] == "UNKNOWN"
+                    and current_bond["identity_type"] in {"UNKNOWN", "NAME_ONLY"}
                 )
-                if not is_unresolved_placeholder:
+                if not is_unresolved_link:
                     raise ValueError(
                         "The transaction already has a different bond link; "
                         "the identification result was not applied."
                     )
         elif current_bond_id:
-            current_bond = conn.execute(
+            if previous_status in {
+                BondMatchStatus.PRIMARY_ISIN_MATCH.value,
+                BondMatchStatus.SECONDARY_ISSUER_MATCH.value,
+            }:
+                raise ValueError(
+                    "The transaction already has an identified bond link; "
+                    "an unresolved result cannot remove it."
+                )
+            current_bond = connection.execute(
                 "SELECT isin, identity_type FROM bonds WHERE bond_id = ?",
                 (current_bond_id,),
             ).fetchone()
             if (
                 current_bond is not None
                 and current_bond["isin"] is None
-                and current_bond["identity_type"] == "UNKNOWN"
+                and current_bond["identity_type"] in {"UNKNOWN", "NAME_ONLY"}
             ):
                 target_bond_id = None
+            else:
+                raise ValueError(
+                    "The transaction has an existing bond link; an unresolved "
+                    "result cannot remove it automatically."
+                )
 
-        conn.execute(
+        connection.execute(
             """
             UPDATE transactions
             SET bond_id = ?, identification_status = ?
@@ -1240,7 +1382,7 @@ def persist_identification_result(
             (target_bond_id, result.status.value, transaction_id),
         )
         audit_inserted = _insert_identification_audit(
-            conn,
+            connection,
             (
                 str(uuid.uuid4()),
                 transaction_id,
@@ -1256,7 +1398,8 @@ def persist_identification_result(
                 datetime.now().isoformat(),
             ),
         )
-        conn.commit()
+        if owns_connection:
+            connection.commit()
         return {
             "transaction_id": transaction_id,
             "identification_status": result.status.value,
@@ -1265,10 +1408,12 @@ def persist_identification_result(
             "audit_inserted": bool(audit_inserted),
         }
     except Exception:
-        conn.rollback()
+        if owns_connection:
+            connection.rollback()
         raise
     finally:
-        conn.close()
+        if owns_connection:
+            connection.close()
 
 
 def fetch_database_data(db_path: str = DB_PATH) -> Dict[str, Any]:
@@ -1296,6 +1441,18 @@ def fetch_database_data(db_path: str = DB_PATH) -> Dict[str, Any]:
             linked_message_ids.setdefault(row["transaction_id"], []).append(
                 row["message_id"]
             )
+        linked_transaction_rows = conn.execute(
+            """
+            SELECT message_id, transaction_id
+            FROM transaction_messages
+            ORDER BY message_id, transaction_id
+            """
+        ).fetchall()
+        linked_transaction_ids: Dict[str, List[str]] = {}
+        for row in linked_transaction_rows:
+            linked_transaction_ids.setdefault(row["message_id"], []).append(
+                row["transaction_id"]
+            )
         transactions = []
         for row in tx_rows:
             transaction = dict(row)
@@ -1322,11 +1479,19 @@ def fetch_database_data(db_path: str = DB_PATH) -> Dict[str, Any]:
 
         bonds_rows = conn.execute("SELECT * FROM bonds ORDER BY bond_identity ASC").fetchall()
         msgs_rows = conn.execute("SELECT * FROM messages ORDER BY timestamp ASC LIMIT 500").fetchall()
+        messages = []
+        for row in msgs_rows:
+            message = dict(row)
+            message["transaction_ids"] = linked_transaction_ids.get(
+                message["message_id"],
+                [],
+            )
+            messages.append(message)
 
         return {
             "transactions": transactions,
             "bonds": [dict(r) for r in bonds_rows],
-            "messages": [dict(r) for r in msgs_rows],
+            "messages": messages,
             "counts": {
                 "transactions": len(tx_rows),
                 "bonds": len(bonds_rows),

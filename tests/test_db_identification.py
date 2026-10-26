@@ -42,22 +42,22 @@ class IdentificationPersistenceTests(unittest.TestCase):
             conn.close()
 
     @staticmethod
-    def _reference():
+    def _reference(isin="US0378331005"):
         return BondReferenceRecord(
             source_values={
-                "ISIN": "US0378331005",
+                "ISIN": isin,
                 "NAME_OF_ISSUER": "Synthetic Issuer",
                 "SECURITY_DESCRIPTION": "Synthetic Security",
                 "MATURITY_DATE": "14-Jan-2030",
                 "INTEREST_RATE": "8.50%",
                 "CURRENCY": "USD",
             },
-            normalized_isin="US0378331005",
+            normalized_isin=isin,
             normalized_issuer_key="synthetic issuer",
             maturity_date=date(2030, 1, 14),
         )
 
-    def _result(self, status, reference=None, evidence=True):
+    def _result(self, status, reference=None, evidence=True, isin="US0378331005"):
         source_text = "Synthetic Issuer"
         source_evidence = (
             (
@@ -77,7 +77,7 @@ class IdentificationPersistenceTests(unittest.TestCase):
         matching_method = "synthetic-method"
         if status == BondMatchStatus.PRIMARY_ISIN_MATCH:
             isin_result = extract_isin_from_message(
-                "ISIN US0378331005", "synthetic-message"
+                f"ISIN {isin}", "synthetic-message"
             )
             isin_source_evidence = isin_result.source_evidence
             isin_status = IsinStatus.VALID_ISIN
@@ -239,6 +239,196 @@ class IdentificationPersistenceTests(unittest.TestCase):
         self.assertIsNone(stored["identification_status"])
         self.assertEqual(bond_count, 0)
         self.assertEqual(audit_count, 0)
+
+    def test_later_identification_failure_rolls_back_entire_upload(self):
+        parsed_messages = [{
+            "message_id": "synthetic-upload-message",
+            "sender": "Synthetic Sender",
+            "message_text": "Synthetic upload message",
+            "timestamp": "2026-10-26T10:00:00",
+        }]
+        deals = [
+            {
+                "chat_key": "synthetic-chat",
+                "context_id": f"synthetic-context-{index}",
+                "message_ids": ["synthetic-upload-message"],
+                "message_indices": [0],
+                "status": "INITIATED",
+            }
+            for index in range(2)
+        ]
+        result = self._result(
+            BondMatchStatus.PRIMARY_ISIN_MATCH,
+            self._reference(),
+        )
+        original_insert = db._insert_identification_audit
+        write_count = 0
+
+        def fail_second_audit(conn, audit_values):
+            nonlocal write_count
+            write_count += 1
+            if write_count == 2:
+                raise sqlite3.OperationalError("synthetic later audit failure")
+            return original_insert(conn, audit_values)
+
+        with mock.patch(
+            "db._insert_identification_audit",
+            side_effect=fail_second_audit,
+        ):
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError,
+                "synthetic later audit failure",
+            ):
+                db.persist_upload(
+                    self.db_path,
+                    "synthetic-upload",
+                    parsed_messages,
+                    deals,
+                    source_hash="synthetic-upload-source",
+                    defer_bond_creation=True,
+                    identification_results=[result, result],
+                )
+
+        conn = db.get_db_connection(self.db_path)
+        try:
+            message_count = conn.execute(
+                "SELECT COUNT(*) FROM messages "
+                "WHERE message_id = 'synthetic-upload-message'"
+            ).fetchone()[0]
+            transaction_count = conn.execute(
+                "SELECT COUNT(*) FROM transactions "
+                "WHERE source_hash = 'synthetic-upload-source'"
+            ).fetchone()[0]
+            link_count = conn.execute(
+                "SELECT COUNT(*) FROM transaction_messages"
+            ).fetchone()[0]
+            bond_count = conn.execute("SELECT COUNT(*) FROM bonds").fetchone()[0]
+            audit_count = conn.execute(
+                "SELECT COUNT(*) FROM identification_audit"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        self.assertEqual(write_count, 2)
+        self.assertEqual(message_count, 0)
+        self.assertEqual(transaction_count, 0)
+        self.assertEqual(link_count, 0)
+        self.assertEqual(bond_count, 0)
+        self.assertEqual(audit_count, 0)
+
+    def test_changed_extraction_retry_does_not_relink_existing_transaction(self):
+        parsed_messages = [{
+            "message_id": "synthetic-retry-message",
+            "sender": "Synthetic Sender",
+            "message_text": "Synthetic retry message",
+            "timestamp": "2026-10-26T10:00:00",
+        }]
+        original_deal = {
+            "chat_key": "synthetic-chat",
+            "context_id": "synthetic-retry-context",
+            "message_ids": ["synthetic-retry-message"],
+            "message_indices": [0],
+            "status": "INITIATED",
+            "price": 99.0,
+        }
+        original_result = self._result(
+            BondMatchStatus.PRIMARY_ISIN_MATCH,
+            self._reference(),
+        )
+        first = db.persist_upload(
+            self.db_path,
+            "synthetic-retry-upload",
+            parsed_messages,
+            [original_deal],
+            source_hash="synthetic-retry-source",
+            defer_bond_creation=True,
+            identification_results=[original_result],
+        )
+        transaction_id = first["transaction_ids"][0]
+        conn = db.get_db_connection(self.db_path)
+        try:
+            original = conn.execute(
+                "SELECT bond_id, final_price FROM transactions "
+                "WHERE transaction_id = ?",
+                (transaction_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        changed_deal = {**original_deal, "price": 105.0}
+        changed_result = self._result(
+            BondMatchStatus.PRIMARY_ISIN_MATCH,
+            self._reference("US5949181045"),
+            isin="US5949181045",
+        )
+        retry = db.persist_upload(
+            self.db_path,
+            "synthetic-retry-upload",
+            parsed_messages,
+            [changed_deal],
+            source_hash="synthetic-retry-source",
+            defer_bond_creation=True,
+            identification_results=[changed_result],
+        )
+
+        self.assertTrue(retry["already_stored"])
+        self.assertEqual(retry["transaction_ids"], [transaction_id])
+        self.assertEqual(
+            retry["identification_by_status"],
+            {"primary_isin_match": 1},
+        )
+        self.assertEqual(retry["identification_skipped"], 1)
+        conn = db.get_db_connection(self.db_path)
+        try:
+            stored = conn.execute(
+                "SELECT bond_id, final_price FROM transactions "
+                "WHERE transaction_id = ?",
+                (transaction_id,),
+            ).fetchone()
+            audit_count = conn.execute(
+                "SELECT COUNT(*) FROM identification_audit "
+                "WHERE transaction_id = ?",
+                (transaction_id,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        self.assertEqual(stored["bond_id"], original["bond_id"])
+        self.assertEqual(stored["final_price"], 99.0)
+        self.assertEqual(audit_count, 1)
+
+        with self.assertRaisesRegex(ValueError, "different result requires"):
+            db.persist_upload(
+                self.db_path,
+                "synthetic-retry-upload",
+                parsed_messages,
+                [changed_deal],
+                source_hash="synthetic-retry-source",
+                update_existing=True,
+                defer_bond_creation=True,
+                identification_results=[changed_result],
+            )
+
+        conn = db.get_db_connection(self.db_path)
+        try:
+            after_conflict = conn.execute(
+                "SELECT bond_id, final_price FROM transactions "
+                "WHERE transaction_id = ?",
+                (transaction_id,),
+            ).fetchone()
+            bond_count = conn.execute("SELECT COUNT(*) FROM bonds").fetchone()[0]
+            audit_count = conn.execute(
+                "SELECT COUNT(*) FROM identification_audit "
+                "WHERE transaction_id = ?",
+                (transaction_id,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        self.assertEqual(after_conflict["bond_id"], original["bond_id"])
+        self.assertEqual(after_conflict["final_price"], 99.0)
+        self.assertEqual(bond_count, 1)
+        self.assertEqual(audit_count, 1)
 
     def test_retry_is_idempotent_for_identical_decision(self):
         result = self._result(

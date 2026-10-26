@@ -25,6 +25,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 import config
 import privacy
+from bond_matching import BondMatchResult
+from bond_reference import BondReferenceIndex
 from normalize import (
     is_valid_isin,
     normalize_maturity,
@@ -1334,6 +1336,33 @@ def _same_number(left: str, right: str) -> bool:
         return left == right
 
 
+def _has_explicit_price_label(value: Any, lines: List[str]) -> bool:
+    wanted_numbers = _number_tokens(str(value))
+    if len(wanted_numbers) != 1:
+        return False
+    price_expression = re.compile(
+        r"\b(?:clean\s+)?price\b\s*"
+        r"(?:(?:is|at|of)\s+|[:=@-]\s*)?"
+        r"(?P<number>\d+(?:[.,]\d+)?)"
+        r"(?![\d.,]|\s*%)",
+        re.IGNORECASE,
+    )
+    for line in lines:
+        normalized = unicodedata.normalize(
+            "NFKC",
+            _evidence_body(line),
+        ).translate(_EVIDENCE_DIGITS)
+        if any(
+            _same_number(
+                wanted_numbers[0],
+                match.group("number").replace(",", ""),
+            )
+            for match in price_expression.finditer(normalized)
+        ):
+            return True
+    return False
+
+
 def _numbered_lines(context_snippet: Optional[str]) -> Dict[str, str]:
     """Map '#n' to the full message text, including indented continuation lines.
     Quoted 'replying to:' lines are excluded: they belong to another message."""
@@ -1379,7 +1408,9 @@ def _value_appears_in_lines(field: str, value: Any, lines: List[str]) -> bool:
     bodies = [_evidence_body(line) for line in lines]
     if field == "isin_text":
         return any(str(value) in line for line in bodies)
-    if field in {"ytm", "quantity_text", "coupon_rate", "price"}:
+    if field == "price":
+        return _has_explicit_price_label(value, bodies)
+    if field in {"ytm", "quantity_text", "coupon_rate"}:
         wanted_numbers = _number_tokens(str(value))
         if not wanted_numbers:
             return False
@@ -2025,3 +2056,22 @@ def validate_extraction(
         or validated.get("settlement_needs_review", False)
     )
     return validated
+
+
+def identify_extracted_bond(
+    deal: Dict[str, Any],
+    parsed_messages: List[Dict[str, Any]],
+    message_number_map: Dict[str, str],
+    reference_index: Optional[BondReferenceIndex],
+    reference_error: Optional[str] = None,
+) -> BondMatchResult:
+    """Apply source-based ISIN validation and conservative reference matching."""
+    from bond_identification import identify_extracted_deal
+
+    return identify_extracted_deal(
+        deal,
+        parsed_messages,
+        message_number_map,
+        reference_index,
+        reference_error,
+    )

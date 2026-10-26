@@ -233,6 +233,34 @@ def _request_field_evidence(
     return tuple(accepted), None
 
 
+def _issuer_contradicts_reference(
+    request: BondMatchRequest,
+    reference: BondReferenceRecord,
+) -> bool:
+    evidence = request.issuer_evidence
+    if (
+        not request.raw_issuer_text
+        or evidence is None
+        or not _evidence_is_supported(
+            evidence,
+            "issuer",
+            request.trade_message_id,
+        )
+        or normalize_issuer_key(evidence.source_value)
+        != normalize_issuer_key(request.raw_issuer_text)
+    ):
+        return False
+    reference_issuer = normalize_issuer_key(
+        reference.source_values.get("NAME_OF_ISSUER")
+    )
+    source_issuer = normalize_issuer_key(evidence.source_value)
+    return bool(
+        reference_issuer
+        and source_issuer
+        and source_issuer != reference_issuer
+    )
+
+
 def _secondary_candidates(request: BondMatchRequest, index: BondReferenceIndex) -> _SecondaryResult:
     if not request.raw_issuer_text or not request.raw_issuer_text.strip():
         return _SecondaryResult((), (), "No issuer text was supplied.")
@@ -478,6 +506,28 @@ def match_bond(
                 source_evidence=evidence,
             )
 
+    if (
+        evidence_error
+        and primary_record is not None
+        and _issuer_contradicts_reference(request, primary_record)
+    ):
+        return _make_result(
+            request,
+            BondMatchStatus.CONFLICTING_EVIDENCE,
+            "conflict",
+            tuple(attempted),
+            "The source-supported issuer contradicts the issuer on the "
+            "primary ISIN reference record; neither was selected.",
+            candidate_references=(primary_record,),
+            isin_status=isin_status,
+            normalized_isin=normalized_isin,
+            source_evidence=tuple(
+                evidence
+                for evidence in (request.issuer_evidence,)
+                if evidence is not None
+            ),
+        )
+
     if evidence_error:
         if primary_record is not None:
             return _make_result(
@@ -522,6 +572,24 @@ def match_bond(
         secondary = _secondary_candidates(request, reference_index)
 
     if primary_record is not None:
+        if _issuer_contradicts_reference(request, primary_record):
+            return _make_result(
+                request,
+                BondMatchStatus.CONFLICTING_EVIDENCE,
+                "conflict",
+                tuple(attempted),
+                "The source-supported issuer contradicts the issuer on the "
+                "primary ISIN reference record; neither was selected.",
+                candidate_references=tuple(
+                    {
+                        record.normalized_isin: record
+                        for record in (primary_record, *secondary.candidates)
+                    }.values()
+                ),
+                isin_status=isin_status,
+                normalized_isin=normalized_isin,
+                source_evidence=evidence,
+            )
         if len(secondary.candidates) == 1:
             secondary_record = secondary.candidates[0]
             if secondary_record.normalized_isin != primary_record.normalized_isin:

@@ -140,15 +140,18 @@ class AppExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deal["chat_type"], "GROUP")
         self.assertEqual(deal["message_ids"], ["message-later"])
 
-        with patch.object(
-            app.db,
-            "persist_upload",
-            return_value={
-                "messages_stored": 1,
-                "bonds_stored": 0,
-                "transactions_stored": 1,
-            },
-        ) as persist_upload:
+        with (
+            patch.object(
+                app.db,
+                "persist_upload",
+                return_value={
+                    "messages_stored": 1,
+                    "bonds_stored": 0,
+                    "transactions_stored": 1,
+                    "transaction_ids": ["synthetic-transaction-id"],
+                },
+            ) as persist_upload,
+        ):
             await app.store_extracted_data(upload_id)
 
         stored_deal = next(
@@ -160,6 +163,10 @@ class AppExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             persist_upload.call_args.kwargs["context_message_maps"]["later"],
             {"#1": "message-later"},
+        )
+        self.assertEqual(
+            len(persist_upload.call_args.kwargs["identification_results"]),
+            1,
         )
 
     async def test_empty_extraction_returns_the_complete_report_shape(self):
