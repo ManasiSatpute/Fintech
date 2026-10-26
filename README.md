@@ -195,7 +195,7 @@ python scripts\smoke_run.py data\real_chat.jsonl
 - **No official cut-off time.** Chats can run around the clock.
 - **Only buyer and seller** are modelled.
 - **Models:** open-weight models are preferred (the mentor mentioned Groq).
-- **Out of scope:** audit trails, role IDs, dashboard. Manual verification that a trade really happened is expected before a record is trusted.
+- **Out of scope:** role IDs and dashboard. Identification decisions are audited separately; manual verification that a trade really happened is still expected before a record is trusted.
 
 ---
 
@@ -233,10 +233,11 @@ Add a unit test with synthetic line numbers (yield cited on lines 2 and 9, accep
 A refusal ("pass", "no sir", "no requirement", "nahi", "rehne do", see `lexicon.json`) in direct reply to a specific offer or inquiry (by reply link or next message in the same chat) sets that deal to CANCELLED with the refusal line as `status_evidence`. A refusal that cannot be tied to an offer stays UNCERTAIN. Silence stays INITIATED.
 
 **C. Phase 1 SQLite database hardening (`db.py`, implemented).**
-- Schema version 4 migrates existing version 3 databases in place; version 2 databases pass through the existing version 3 migration first. Migrations are transactional and do not replace the database or delete rows.
-- Foreign-key enforcement is enabled and verified on every project database connection. `transactions.identification_status` is independent of the existing trade `status`; `transactions.bond_id` remains required so existing persistence and identity behavior do not change.
+- Schema version 5 migrates earlier supported databases in place; migrations are transactional and do not replace the database or delete rows.
+- Foreign-key enforcement is enabled and verified on every project database connection. `transactions.identification_status` is independent of the existing trade `status`; `transactions.bond_id` may be null until a unique bond match is persisted.
 - A unique partial index covers non-null `bonds.isin`. If duplicate ISIN groups exist, migration stops and rolls back without changing rows. Back up the database, review duplicates locally, and resolve each manually: correct erroneous ISINs only from an authoritative source; for confirmed duplicate records representing the same bond, reassign dependent transactions to a reviewed canonical bond ID and set the duplicate row's ISIN to null while retaining the row. Verify foreign keys and the absence of duplicate non-null ISINs, then rerun application initialization. Never delete the duplicate bond rows as an automatic migration step.
-- `identification_audit` is a minimal future-compatible table; detailed audit fields and write behavior are deferred to Phase 5. Bond identity / dedupe logic remains unchanged.
+- Version 5 rebuilds `transactions` transactionally to remove `NOT NULL` from `bond_id`, retaining its columns, rows, indexes, and child references; it validates foreign keys before completing.
+- `identification_audit` stores distinct identification decisions, their method, reason, raw/normalized issuer values, ISIN, candidates and source evidence. Repeating the same decision for a transaction is idempotent.
 
 **D. Phase 2 in-memory bond reference index (`bond_reference.py`, implemented).**
 - Configure the external file with `BOND_REFERENCE_CSV`; the default is `ISIN_DETAILS.csv` beside `config.py`. The CSV stays outside SQLite and remains excluded from Git.
@@ -257,6 +258,12 @@ A refusal ("pass", "no sir", "no requirement", "nahi", "rehne do", see `lexicon.
 - Multiple candidates are returned as ambiguous. If primary and unique secondary evidence point to different securities, the result is a conflict and selects neither. Invalid, checksum-failing, unsupported, or unrelated-message identifier evidence is never used for exact lookup.
 - The reference data has no credit-rating column. Alias-to-legal-name resolution is not applied because the current alias file does not establish exact mappings to reference issuer records.
 - This remains an independent matching utility: no extraction-pipeline integration, persistence, audit writes, or schema changes.
+
+**Phase 5 SQLite persistence and identification audit (`db.py`, implemented).**
+- `persist_identification_result()` accepts a Phase 4 result and persists the status, method, explanation, candidate references and source evidence in one transaction. Only unique primary ISIN and secondary issuer matches can create or link an authoritative reference bond.
+- No-match, ambiguous, conflicting, invalid or unsupported outcomes do not create a bond link. Existing non-placeholder bond links are not overwritten by a conflicting decision.
+- Identical decisions for the same transaction share a deterministic audit key and do not create duplicate audit rows. A failed audit write rolls back bond and transaction changes.
+- `persist_upload()` leaves `bond_id` null when extraction supplies no bond identity instead of creating an `UNKNOWN` placeholder. The matcher and its persistence API are not wired into the application pipeline.
 
 **E. Prompt 12, `app.py`.** Remove the top-8 cap and ISIN-first sorting (process all contexts chronologically). Wrap each context in its own try/except and collect errors with the raw model output. `/extract` returns a full report (messages, media, system, skipped, contexts, skipped_low_relevance, processed, failed, deals by status, `needs_review` count, token usage). Add a TTL for in-memory upload sessions. Pass chat info and message ids through so `/store` links messages through the join table.
 
