@@ -2,6 +2,7 @@
 
 import os
 from datetime import date
+from pathlib import Path
 from typing import List, Optional
 
 
@@ -76,4 +77,11 @@ ALLOWED_ORIGINS = _list_setting(
 )
 MODEL_CONTEXT_LENGTH_FALLBACK = _int_setting(
     "MODEL_CONTEXT_LENGTH_FALLBACK", 262144, minimum=1
+)
+
+BOND_REFERENCE_CSV = Path(
+    os.getenv(
+        "BOND_REFERENCE_CSV",
+        str(Path(__file__).resolve().parent / "ISIN_DETAILS.csv"),
+    )
 )

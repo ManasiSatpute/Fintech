@@ -26,7 +26,8 @@ Branch with the latest work: `pipeline-improvements`.
 - Yield cleanup: sign stripped, out-of-range yields (outside about 3 to 25) nulled and flagged, "ISIN - number" treated as units.
 - Extraction and database views show chat names, status and review badges, confidence, evidence, missing fields, quantities, amounts, settlement details, and report counts.
 - Phase 1 SQLite hardening: versioned in-place migrations, verified per-connection foreign keys, separate identification status, and a duplicate-checked partial unique ISIN index.
-- Last test run: **109 tests passing** (plus 15 subtests).
+- Phase 2 bond reference index: a configurable external CSV is loaded into immutable in-memory ISIN and issuer indexes; the extraction pipeline does not use it yet.
+- Last test run: **122 tests passing** (plus 15 subtests).
 
 **Not done yet (in order)**
 
@@ -174,7 +175,7 @@ python scripts\smoke_run.py data\real_chat.jsonl
 5. **Build the snippet**: numbered lines (`#n`), `[OWN]` tag, quoted replies, phone numbers masked.
 6. **LLM extraction** into a Pydantic schema (`{"deals": [...]}`), temperature 0, retries, evidence line numbers per field, nothing defaulted.
 7. **Validate**: evidence check (a value must appear in its cited lines or it becomes null), normalisers, CONCLUDED rules, confidence, `needs_review`.
-8. **Store** to SQLite (blocked until prompt 11).
+8. **Store** extracted trade records and message links in SQLite.
 
 **Design principle:** the LLM interprets meaning; deterministic code records facts. Unknown means null, never a default.
 
@@ -235,17 +236,24 @@ A refusal ("pass", "no sir", "no requirement", "nahi", "rehne do", see `lexicon.
 - A unique partial index covers non-null `bonds.isin`. If duplicate ISIN groups exist, migration stops and rolls back without changing rows. Back up the database, review duplicates locally, and resolve each manually: correct erroneous ISINs only from an authoritative source; for confirmed duplicate records representing the same bond, reassign dependent transactions to a reviewed canonical bond ID and set the duplicate row's ISIN to null while retaining the row. Verify foreign keys and the absence of duplicate non-null ISINs, then rerun application initialization. Never delete the duplicate bond rows as an automatic migration step.
 - `identification_audit` is a minimal future-compatible table; detailed audit fields and write behavior are deferred to Phase 5. Bond identity / dedupe logic remains unchanged.
 
-**D. Prompt 12, `app.py`.** Remove the top-8 cap and ISIN-first sorting (process all contexts chronologically). Wrap each context in its own try/except and collect errors with the raw model output. `/extract` returns a full report (messages, media, system, skipped, contexts, skipped_low_relevance, processed, failed, deals by status, `needs_review` count, token usage). Add a TTL for in-memory upload sessions. Pass chat info and message ids through so `/store` links messages through the join table.
+**D. Phase 2 in-memory bond reference index (`bond_reference.py`, implemented).**
+- Configure the external file with `BOND_REFERENCE_CSV`; the default is `ISIN_DETAILS.csv` beside `config.py`. The CSV stays outside SQLite and remains excluded from Git.
+- `get_bond_reference_index()` lazily loads and reuses an immutable snapshot. `reload_bond_reference_index()` explicitly builds and atomically replaces it. `BondReferenceIndex.load(path)` builds an independent snapshot for tools and tests.
+- Exact ISIN lookup normalizes case and whitespace. Issuer candidate retrieval normalizes Unicode, case and whitespace. Original values remain available separately from normalized lookup keys.
+- Duplicate identifiers are counted. Identical rows remain lookupable; conflicting rows return no single-record ISIN match and remain available as candidates for review. Missing headers, unreadable files, and files with no valid records raise `BondReferenceError`.
+- This phase does not make identification decisions or connect to the extraction pipeline.
 
-**E. Prompt 13, `privacy.py` (done).** Mask phones, `@numeric` mentions, URLs, emails, bank or account fragments and sender numbers before the model. Person names are optional (`MASK_PERSON_NAMES`, default false). Do **not** mask ISINs, yields, quantities, dates or RFQ ids. Keep an in-memory placeholder map and restore model results locally after validation.
+**E. Prompt 12, `app.py`.** Remove the top-8 cap and ISIN-first sorting (process all contexts chronologically). Wrap each context in its own try/except and collect errors with the raw model output. `/extract` returns a full report (messages, media, system, skipped, contexts, skipped_low_relevance, processed, failed, deals by status, `needs_review` count, token usage). Add a TTL for in-memory upload sessions. Pass chat info and message ids through so `/store` links messages through the join table.
 
-**F. Prompt 14, tests and `scripts/smoke_run.py` (done).** Offline tests with a mocked LLM and synthetic fixtures (never real data). `smoke_run.py` follows the `/extract` pipeline and prints aggregate counts only: messages, chats, skipped, media, contexts, reply-linked, unresolved replies, `skipped_low_relevance`, deals by status, `needs_review`, warnings by type, and token/context-window totals.
+**F. Prompt 13, `privacy.py` (done).** Mask phones, `@numeric` mentions, URLs, emails, bank or account fragments and sender numbers before the model. Person names are optional (`MASK_PERSON_NAMES`, default false). Do **not** mask ISINs, yields, quantities, dates or RFQ ids. Keep an in-memory placeholder map and restore model results locally after validation.
 
-**G. Prompt 15, UI (`static/`) (done).** Extraction and database views show chat name, status badges for all statuses, `needs_review` and confidence, missing fields, evidence line numbers, quantity as said and normalized amount, settlement text and date, plus extraction report counts.
+**G. Prompt 14, tests and `scripts/smoke_run.py` (done).** Offline tests with a mocked LLM and synthetic fixtures (never real data). `smoke_run.py` follows the `/extract` pipeline and prints aggregate counts only: messages, chats, skipped, media, contexts, reply-linked, unresolved replies, `skipped_low_relevance`, deals by status, `needs_review`, warnings by type, and token/context-window totals.
 
-**H. Prompt 16, before/after.** Re-run the baseline script on the same real file with the same model and produce a side-by-side table (contexts, dropped or skipped messages, contexts sent to the model, deals by status, `needs_review`). List messages that were previously dropped and are now kept.
+**H. Prompt 15, UI (`static/`) (done).** Extraction and database views show chat name, status badges for all statuses, `needs_review` and confidence, missing fields, evidence line numbers, quantity as said and normalized amount, settlement text and date, plus extraction report counts.
 
-**I. Primary / secondary bond identity and LLM context assignment (mentor reviews).**
+**I. Prompt 16, before/after.** Re-run the baseline script on the same real file with the same model and produce a side-by-side table (contexts, dropped or skipped messages, contexts sent to the model, deals by status, `needs_review`). List messages that were previously dropped and are now kept.
+
+**J. Primary / secondary bond identity and LLM context assignment (mentor reviews).**
 - Context assignment: for each new message give the LLM the active contexts (short cards: bond details so far plus last few messages) and ask: same context / new context / not trade-related, with a confidence. Time gap becomes a hint only. Low confidence goes to review. A multi-bond message updates several contexts. Keep the assigner behind the `assign_contexts` function in `pipeline.py`.
 - Identity ladder: validated ISIN, then partial ISIN, then structured name, then issuer plus maturity plus coupon plus rating (via `issuer_aliases.json`). Output levels: ISIN-confirmed, uniquely resolved by secondary details, partial, ambiguous (several candidates; never guess), unknown. Carry identity forward within a context so later "Bond Unspecified" messages inherit it. The same bond can appear under different issuer names in different chats, with the same ISIN.
 - Cross-chat linking of one deal (broadcast, negotiation, internal dealing, ops) is a later step above per-chat contexts.
@@ -256,20 +264,19 @@ A refusal ("pass", "no sir", "no requirement", "nahi", "rehne do", see `lexicon.
 
 1. No deal reaches CONCLUDED yet (item A).
 2. Explicit refusals stay UNCERTAIN (item B).
-3. `/store` fails with "cannot store the new extraction format" until item C.
-4. One conversation can be split into several records, including several "Bond Unspecified / UNCERTAIN" rows (item I).
-5. The same broadcast posted to several chats creates separate records (needs cross-chat linking).
-6. When the owner acts as an intermediary (a client bids, the owner asks a dealing group for a seller), the side can flip between runs. This needs a decision from the mentor on how to represent the broker's two legs.
-7. A package offer ("package offer at 8.4%") copies the same yield onto every bond; it belongs in `package_note`.
-8. Isolated one-letter acknowledgements and bare ack messages have no bond context on their own.
-9. Platform trades (price lives on the exchange RFQ platform, not in the chat) show no yield in the chat. Decide what status these get.
-10. Open decisions for the mentor: broker two-leg representation, settlement stored as date plus label, post-trade steps ("reported", "accepted", "validated") in or out of scope, how long an unanswered offer stays INITIATED, bond master data availability for face value and ISIN lookup, what masking is required before text goes to a hosted LLM.
+3. One conversation can be split into several records, including several "Bond Unspecified / UNCERTAIN" rows (item J).
+4. The same broadcast posted to several chats creates separate records (needs cross-chat linking).
+5. When the owner acts as an intermediary (a client bids, the owner asks a dealing group for a seller), the side can flip between runs. This needs a decision from the mentor on how to represent the broker's two legs.
+6. A package offer ("package offer at 8.4%") copies the same yield onto every bond; it belongs in `package_note`.
+7. Isolated one-letter acknowledgements and bare ack messages have no bond context on their own.
+8. Platform trades (price lives on the exchange RFQ platform, not in the chat) show no yield in the chat. Decide what status these get.
+9. Open decisions for the mentor: broker two-leg representation, settlement stored as date plus label, post-trade steps ("reported", "accepted", "validated") in or out of scope, how long an unanswered offer stays INITIATED, bond master data availability for face value and ISIN lookup, what masking is required before text goes to a hosted LLM.
 
 ---
 
 ## 11. Working conventions
 
-- Follow `AGENTS.md` (also `.github/copilot-instructions.md`). In short: no hardcoded sample-chat content in code, domain data in JSON config; deterministic code is pure functions with tests; never invent values; never silently drop data; keep existing function names and signatures; add tests for every behaviour change; do not touch bond identity / dedupe in `db.py` outside item I.
+- Follow `AGENTS.md` (also `.github/copilot-instructions.md`). In short: no hardcoded sample-chat content in code, domain data in JSON config; deterministic code is pure functions with tests; never invent values; never silently drop data; keep existing function names and signatures; add tests for every behaviour change; do not touch bond identity / dedupe in `db.py` outside item J.
 - Work on a feature branch. Commit specific files, never `git add .`.
 - When using an AI assistant on this repo, tell it to follow `AGENTS.md` and to report counts only from `data/` and `baseline/`.
 
@@ -288,4 +295,3 @@ A refusal ("pass", "no sir", "no requirement", "nahi", "rehne do", see `lexicon.
 | Only 8 contexts processed | Set `$env:MAX_CONTEXTS="none"` before starting the server |
 | Sides (buyer / seller) look wrong | Set `OWN_SENDER_NAMES` to the owner's display name exactly as in the chat |
 | Port already in use | Close the old `uvicorn` window or add `--port 8001` |
-| `/store` error about the new extraction format | Expected until item C (prompt 11) is done |
