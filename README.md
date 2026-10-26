@@ -11,7 +11,7 @@ Branch with the latest work: `pipeline-improvements`.
 
 ## 1. Where the project stands
 
-**Done (prompts 0 to 10 and 13 to 14, plus follow-up fixes)**
+**Done (prompts 0 to 10 and 13 to 15, plus follow-up fixes)**
 
 - Central settings in `config.py` (every tunable overridable by environment variable).
 - Parser with stable chat identity (`chat_key` from group id / counterpart number), stable message ids, day-first/month-first date detection, no silent `datetime.now()` fallback, reply links and media kept.
@@ -24,6 +24,7 @@ Branch with the latest work: `pipeline-improvements`.
 - New extraction schema (several deals per window, evidence line numbers, nothing defaulted) and validation (evidence check, stricter CONCLUDED rule, confidence, `needs_review`).
 - Partial-ISIN handling: anything that is not a full valid ISIN moves to `partial_isin_text`.
 - Yield cleanup: sign stripped, out-of-range yields (outside about 3 to 25) nulled and flagged, "ISIN - number" treated as units.
+- Extraction and database views show chat names, status and review badges, confidence, evidence, missing fields, quantities, amounts, settlement details, and report counts.
 - Last test run: **99 tests passing** (plus 15 subtests).
 
 **Not done yet (in order)**
@@ -32,9 +33,8 @@ Branch with the latest work: `pipeline-improvements`.
 2. `CANCELLED` handling for explicit refusals (see Known issues, item 2).
 3. **Prompt 11, database schema** (new statuses and fields; `/store` is blocked until this is done).
 4. Prompt 12, API behaviour (remove the 8-context cap, per-context error handling).
-5. Prompt 15, UI updates.
-6. Prompt 16, before/after comparison against the saved baseline.
-7. Primary / secondary bond identity ladder and LLM-based context assignment (the mentor's reviews, section 8).
+5. Prompt 16, before/after comparison against the saved baseline.
+6. Primary / secondary bond identity ladder and LLM-based context assignment (the mentor's reviews, section 8).
 
 Full details for each are in section 9.
 
@@ -240,7 +240,7 @@ A refusal ("pass", "no sir", "no requirement", "nahi", "rehne do", see `lexicon.
 
 **F. Prompt 14, tests and `scripts/smoke_run.py` (done).** Offline tests with a mocked LLM and synthetic fixtures (never real data). `smoke_run.py` follows the `/extract` pipeline and prints aggregate counts only: messages, chats, skipped, media, contexts, reply-linked, unresolved replies, `skipped_low_relevance`, deals by status, `needs_review`, warnings by type, and token/context-window totals.
 
-**G. Prompt 15, UI (`static/`).** Show chat name, status badges for all statuses, `needs_review` and confidence, missing fields, evidence line numbers, quantity as said and as amount, settlement text and date, partial ISIN, warnings. Show units labelled "Units".
+**G. Prompt 15, UI (`static/`) (done).** Extraction and database views show chat name, status badges for all statuses, `needs_review` and confidence, missing fields, evidence line numbers, quantity as said and normalized amount, settlement text and date, plus extraction report counts.
 
 **H. Prompt 16, before/after.** Re-run the baseline script on the same real file with the same model and produce a side-by-side table (contexts, dropped or skipped messages, contexts sent to the model, deals by status, `needs_review`). List messages that were previously dropped and are now kept.
 

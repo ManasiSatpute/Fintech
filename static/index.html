@@ -9,7 +9,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="/static/style.css">
 </head>
 
 <body>
@@ -439,11 +439,26 @@
         removeStatus();
 
         appendMessage(`
-          Filtered system noise. Found
-          <strong>
-            ${extractData.trade_contexts_count}
-          </strong>
-          trade negotiation context(s).
+          <strong>Extraction report</strong>
+          <div class="report-grid">
+            <div><span>Messages</span><strong>${extractData.messages_parsed ?? 0}</strong></div>
+            <div><span>Media</span><strong>${extractData.media ?? 0}</strong></div>
+            <div><span>System</span><strong>${extractData.system ?? 0}</strong></div>
+            <div><span>Skipped on parse</span><strong>${extractData.skipped_on_parse ?? 0}</strong></div>
+            <div><span>Contexts detected</span><strong>${extractData.contexts_detected ?? 0}</strong></div>
+            <div><span>Contexts extracted</span><strong>${extractData.trade_contexts_count ?? 0}</strong></div>
+            <div><span>Low relevance</span><strong>${extractData.skipped_low_relevance ?? 0}</strong></div>
+            <div><span>Context limit</span><strong>${extractData.skipped_context_limit ?? 0}</strong></div>
+            <div><span>Processed</span><strong>${extractData.processed ?? 0}</strong></div>
+            <div><span>Failed</span><strong>${extractData.failed ?? 0}</strong></div>
+            <div><span>Needs review</span><strong>${extractData.needs_review_count ?? 0}</strong></div>
+            <div><span>Deals by status</span><strong>${escapeHtml(JSON.stringify(extractData.deals_by_status || {}))}</strong></div>
+          </div>
+          <div class="report-meta">
+            Token usage: ${extractData.token_usage?.total_tokens ?? 0}
+            (prompt ${extractData.token_usage?.prompt_tokens ?? 0},
+            completion ${extractData.token_usage?.completion_tokens ?? 0})
+          </div>
         `);
 
         await sleep(400);
@@ -477,13 +492,7 @@
               ? 'EXTRACTION FAILED'
               : (d.status || 'UNCERTAIN');
 
-            let badgeClass = 'badge-incomplete';
-
-            if (status === 'CONCLUDED') {
-              badgeClass = 'badge-concluded';
-            } else if (status === 'DISCARDED' || status === 'CANCELLED') {
-              badgeClass = 'badge-discarded';
-            }
+            const badgeClass = statusBadgeClass(status);
 
             const bond =
               d.bond_identity_text || 'Bond Unspecified';
@@ -505,14 +514,23 @@
               : '—';
 
             const settlement = d.settlement_text || '—';
+            const normalizedAmount = d.normalized_quantity?.amount_inr;
+            const missingFields = Array.isArray(d.missing_fields)
+              ? d.missing_fields
+              : [];
+            const evidenceHtml = renderEvidence(d.evidence);
+            const needsReviewHtml = d.needs_review
+              ? '<span class="badge badge-review">Needs review</span>'
+              : '<span class="badge badge-reviewed">Reviewed</span>';
 
             if (d.extraction_failed) {
               dealsHtml += `
                 <div class="deal-card">
                   <div class="deal-card-header">
                     <div class="deal-title">Extraction failed</div>
-                    <span class="badge ${badgeClass}">${status}</span>
+                    <span class="badge ${badgeClass}">${escapeHtml(status)}</span>
                   </div>
+                  <div class="deal-meta">Chat: ${escapeHtml(d.chat_name || d.chat_key || '—')}</div>
                   <div class="deal-grid">
                     <div class="spec-item">
                       <span class="spec-label">Error</span>
@@ -539,9 +557,18 @@
                   </div>
 
                   <span class="badge ${badgeClass}">
-                    ${status}
+                    ${escapeHtml(status)}
                   </span>
 
+                </div>
+                <div class="deal-meta">
+                  Chat: ${escapeHtml(d.chat_name || d.chat_key || '—')}
+                  ${needsReviewHtml}
+                  <span class="deal-confidence">
+                    Confidence: ${d.confidence === null || d.confidence === undefined
+                      ? '—'
+                      : `${Math.round(d.confidence * 100)}%`}
+                  </span>
                 </div>
 
                 <div class="deal-grid">
@@ -577,6 +604,13 @@
                   </div>
 
                   <div class="spec-item">
+                    <span class="spec-label">Normalized amount</span>
+                    <span class="spec-value highlight">
+                      ${escapeHtml(formatAmount(normalizedAmount))}
+                    </span>
+                  </div>
+
+                  <div class="spec-item">
                     <span class="spec-label">
                       Price / Yield
                     </span>
@@ -598,7 +632,7 @@
 
                   <div class="spec-item">
                     <span class="spec-label">
-                      Settlement
+                      Settlement text
                     </span>
 
                     <span class="spec-value">
@@ -606,6 +640,23 @@
                     </span>
                   </div>
 
+                  <div class="spec-item">
+                    <span class="spec-label">Settlement date</span>
+                    <span class="spec-value">
+                      ${escapeHtml(d.settlement_date || '—')}
+                    </span>
+                  </div>
+
+                </div>
+                <div class="deal-details">
+                  <div><strong>Missing fields:</strong>
+                    ${missingFields.length
+                      ? missingFields.map(field => `<span class="detail-chip">${escapeHtml(field)}</span>`).join('')
+                      : '—'}
+                  </div>
+                  <div><strong>Evidence lines:</strong>
+                    ${evidenceHtml || '—'}
+                  </div>
                 </div>
               </div>
             `;
@@ -785,11 +836,22 @@
           return;
         }
 
+        const chatNames = new Map();
+        (databaseCache.messages || []).forEach(message => {
+          if (message.chat_key && message.chat_name && !chatNames.has(message.chat_key)) {
+            chatNames.set(message.chat_key, message.chat_name);
+          }
+        });
+
         let tbody = rows.map(r => `
           <tr>
 
             <td class="mono-cell">
               ${r.transaction_id.substring(0, 8)}...
+            </td>
+
+            <td>
+              ${escapeHtml(chatNames.get(r.chat_key) || r.chat_key || '—')}
             </td>
 
             <td>
@@ -811,11 +873,16 @@
 
             <td class="mono-cell">
               ${
-                r.quantity
-                  ? r.quantity + ' ' +
-                    (r.quantity_unit || '')
-                  : '—'
+                escapeHtml(r.quantity_text || (
+                  r.quantity !== null && r.quantity !== undefined
+                    ? `${r.quantity} ${r.quantity_unit || ''}`.trim()
+                    : '—'
+                ))
               }
+            </td>
+
+            <td class="mono-cell">
+              ${escapeHtml(formatAmount(r.amount_inr))}
             </td>
 
             <td class="mono-cell">
@@ -840,15 +907,10 @@
             </td>
 
             <td>
-              <span
-                class="badge ${
-                  r.status === 'CONCLUDED'
-                    ? 'badge-concluded'
-                    : 'badge-incomplete'
-                }"
-              >
+              <span class="badge ${statusBadgeClass(r.status)}">
                 ${escapeHtml(r.status ?? '—')}
               </span>
+              ${r.needs_review ? '<span class="badge badge-review">Needs review</span>' : ''}
             </td>
 
             <td>
@@ -865,8 +927,22 @@
               ${
                 r.confidence === null || r.confidence === undefined
                   ? '—'
-                  : r.confidence
+                  : `${Math.round(r.confidence * 100)}%`
               }
+            </td>
+
+            <td
+              class="detail-cell"
+              title="${escapeHtml(formatList(r.missing_fields_json))}"
+            >
+              ${escapeHtml(formatList(r.missing_fields_json))}
+            </td>
+
+            <td
+              class="detail-cell"
+              title="${escapeHtml(formatEvidence(r.evidence_json))}"
+            >
+              ${escapeHtml(formatEvidence(r.evidence_json))}
             </td>
 
             <td class="mono-cell">
@@ -893,10 +969,12 @@
               <thead>
                 <tr>
                   <th>Tx ID</th>
+                  <th>Chat</th>
                   <th>Bond</th>
                   <th>Buyer</th>
                   <th>Seller</th>
-                  <th>Quantity</th>
+                  <th>Quantity as said</th>
+                  <th>Amount (INR)</th>
                   <th>Price (clean)</th>
                   <th>YTM</th>
                   <th>Settlement</th>
@@ -904,6 +982,8 @@
                   <th>Status</th>
                   <th>Needs review</th>
                   <th>Confidence</th>
+                  <th>Missing fields</th>
+                  <th>Evidence lines</th>
                   <th>Created</th>
                 </tr>
               </thead>
@@ -1042,7 +1122,7 @@
               </span>
             </td>
 
-            <td>
+            <td title="${escapeHtml(r.message_text || '')}">
               ${escapeHtml(r.message_text)}
             </td>
 
@@ -1085,14 +1165,86 @@
       }
     }
 
+    function statusBadgeClass(status) {
+      const classes = {
+        INITIATED: 'badge-initiated',
+        NEGOTIATING: 'badge-negotiating',
+        CONCLUDED: 'badge-concluded',
+        CANCELLED: 'badge-cancelled',
+        UNCERTAIN: 'badge-uncertain',
+        DISCARDED: 'badge-discarded'
+      };
+      return classes[status] || 'badge-incomplete';
+    }
+
+    function formatAmount(value) {
+      if (value === null || value === undefined || value === '') return '—';
+      if (typeof value === 'string') {
+        const parsed = parseJsonField(value);
+        if (parsed !== value) return formatAmount(parsed);
+      }
+      if (typeof value === 'object') {
+        const min = value.min === null || value.min === undefined
+          ? '—'
+          : formatCurrency(value.min);
+        const max = value.max === null || value.max === undefined
+          ? '—'
+          : formatCurrency(value.max);
+        return `${min} – ${max}`;
+      }
+      if (typeof value === 'number') return formatCurrency(value);
+      return String(value);
+    }
+
+    function formatCurrency(value) {
+      const number = Number(value);
+      return Number.isFinite(number)
+        ? `₹${number.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`
+        : String(value);
+    }
+
+    function parseJsonField(value) {
+      if (typeof value !== 'string') return value;
+      try {
+        return JSON.parse(value);
+      } catch (error) {
+        return value;
+      }
+    }
+
+    function formatList(value) {
+      const parsed = parseJsonField(value);
+      return Array.isArray(parsed)
+        ? parsed.join(', ')
+        : (parsed === null || parsed === undefined || parsed === '' ? '—' : String(parsed));
+    }
+
+    function formatEvidence(value) {
+      const parsed = parseJsonField(value);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return parsed === null || parsed === undefined || parsed === '' ? '' : String(parsed);
+      }
+      return Object.entries(parsed)
+        .map(([field, lines]) => {
+          const refs = Array.isArray(lines) ? lines.join(', ') : String(lines || '');
+          return refs ? `${field}: ${refs}` : '';
+        })
+        .filter(Boolean)
+        .join('; ');
+    }
+
+    function renderEvidence(value) {
+      return escapeHtml(formatEvidence(value));
+    }
+
     function escapeHtml(str) {
-
-      if (!str) return '';
-
+      if (str === null || str === undefined) return '';
       return String(str)
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
     }
   </script>
 
