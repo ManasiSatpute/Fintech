@@ -190,6 +190,28 @@ class DatabaseStoreTests(unittest.TestCase):
         self.assertIsNone(stored["settlement_date"])
         self.assertEqual(stored["settlement_display"], "—")
 
+    def test_isin_without_bond_identity_does_not_create_invalid_bond_row(self):
+        deal = self.deals()[0]
+        deal["isin_text"] = "synthetic-isin-value"
+
+        self.persist([deal])
+
+        conn = db.get_db_connection(self.db_path)
+        try:
+            transaction = conn.execute(
+                "SELECT bond_id FROM transactions"
+            ).fetchone()
+            transaction_count = conn.execute(
+                "SELECT COUNT(*) FROM transactions"
+            ).fetchone()[0]
+            bond_count = conn.execute("SELECT COUNT(*) FROM bonds").fetchone()[0]
+        finally:
+            conn.close()
+
+        self.assertIsNone(transaction["bond_id"])
+        self.assertEqual(transaction_count, 1)
+        self.assertEqual(bond_count, 0)
+
     def test_mon_vd_stores_other_with_known_date(self):
         deal = self.deals()[0]
         deal["settlement_text"] = "Mon VD"

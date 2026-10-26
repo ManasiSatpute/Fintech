@@ -876,7 +876,7 @@
               <strong>
                 ${escapeHtml(
                   r.bond_identity ||
-                  r.bond_id.substring(0, 8)
+                  (r.bond_id ? r.bond_id.substring(0, 8) : 'Unresolved bond')
                 )}
               </strong>
             </td>

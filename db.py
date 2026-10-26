@@ -723,7 +723,7 @@ def persist_upload(
 
             if existing_bond:
                 bond_id = existing_bond
-            elif isin or bond_identity:
+            elif bond_identity:
                 bond_id = str(uuid.uuid4())
                 conn.execute(
                     """
