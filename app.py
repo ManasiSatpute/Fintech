@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 import config
 import db
 import pipeline
+import privacy
 
 app = FastAPI(title="Bond Trade Extraction App", version="1.0.0")
 
@@ -200,6 +201,10 @@ async def extract_trades(upload_id: str):
                     context_snippet=ctx["snippet_text"],
                     message_datetime=context_datetime,
                 )
+                validated_deal = privacy.restore_pii(
+                    validated_deal,
+                    ctx.get("privacy_map", {}),
+                )
                 validated_deal.update({
                     "context_id": ctx["context_id"],
                     "chat_key": ctx["chat_key"],
@@ -221,6 +226,10 @@ async def extract_trades(upload_id: str):
             raw_output = extraction_result.get(
                 "raw_text",
                 extraction_result.get("raw_output"),
+            )
+            raw_output = privacy.restore_pii(
+                raw_output,
+                ctx.get("privacy_map", {}),
             )
             context_error = {
                 "context_id": ctx["context_id"],

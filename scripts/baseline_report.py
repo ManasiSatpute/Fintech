@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import privacy
+
 
 def _module_missing(name: str) -> bool:
     if name in sys.modules:
@@ -151,12 +153,19 @@ def create_report(input_path: Path) -> Dict[str, Any]:
     for context in selected_contexts:
         result, tokens = extract(context["snippet_text"])
         if result.get("extraction_failed"):
-            non_object_outputs.append(result)
+            non_object_outputs.append(
+                privacy.restore_pii(result, context.get("privacy_map", {}))
+            )
             continue
         deals = result.get("deals", [])
         for raw_deal in deals:
             if not isinstance(raw_deal, dict):
-                non_object_outputs.append(raw_deal)
+                non_object_outputs.append(
+                    privacy.restore_pii(
+                        raw_deal,
+                        context.get("privacy_map", {}),
+                    )
+                )
                 continue
             context_datetime = max(
                 (
@@ -171,10 +180,17 @@ def create_report(input_path: Path) -> Dict[str, Any]:
                 context_snippet=context["snippet_text"],
                 message_datetime=context_datetime,
             )
+            validated_deal = privacy.restore_pii(
+                validated_deal,
+                context.get("privacy_map", {}),
+            )
             extracted_deals.append({
                 "context_id": context["context_id"],
                 "group_name": context.get("group_name"),
-                "raw_llm_json": raw_deal,
+                "raw_llm_json": privacy.restore_pii(
+                    raw_deal,
+                    context.get("privacy_map", {}),
+                ),
                 "validated_deal": validated_deal,
                 "call_tokens": tokens,
             })

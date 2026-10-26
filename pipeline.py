@@ -24,6 +24,7 @@ from langchain_ollama import ChatOllama
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 import config
+import privacy
 from normalize import (
     is_valid_isin,
     normalize_maturity,
@@ -284,6 +285,28 @@ def _private_counterpart(item: Dict[str, Any]) -> str:
     return counterpart
 
 
+def _stable_message_chat_identity(record: Dict[str, Any]) -> str:
+    chat_type = _chat_type(record.get("chat_type"))
+    sender_number = _device_free_number(record.get("sender_number"))
+    receiver_number = _device_free_number(record.get("receiver_number"))
+
+    if chat_type == "PRIVATE":
+        identity = [
+            chat_type,
+            sorted(number for number in (sender_number, receiver_number) if number),
+        ]
+    elif chat_type == "GROUP" and "UNKNOWN" not in record["chat_key"]:
+        return record["chat_key"]
+    else:
+        identity = [
+            chat_type,
+            _normalize_display_name(record.get("chat_name")),
+            sender_number,
+            receiver_number,
+        ]
+    return json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
+
+
 def _is_media_placeholder(text: str) -> Tuple[bool, Optional[str]]:
     match = re.fullmatch(r"\[\s*(media|image|chat)\s+message\s*\]", text.strip(), re.I)
     if not match:
@@ -505,11 +528,16 @@ def parse_raw_chat_content(
     for _, record in parsed_rows:
         record["is_system"] = is_system_message(record)
         record["noise_label"] = get_noise_label(record)
+        chat_identity = _stable_message_chat_identity(record)
         identity = json.dumps(
             [
-                record["chat_key"],
+                chat_identity,
                 record["timestamp"],
+                _normalize_display_name(record["direction"]),
                 record["sender"],
+                _device_free_number(record["sender_number"]),
+                _device_free_number(record["receiver_number"]),
+                record["replying_to"],
                 record["message_text"],
             ],
             ensure_ascii=False,
@@ -936,9 +964,11 @@ def group_into_trade_contexts(
         burst_messages = assigned["messages"]
         group_name = assigned["chat_name"]
         relevance_score = get_window_relevance_score(burst_messages)
+        privacy_map: Dict[str, str] = {}
         snippet_text, message_number_map = format_context_snippet(
             burst_messages,
             group_name,
+            privacy_map,
         )
         context = {
             "context_id": str(uuid.uuid4()),
@@ -954,6 +984,7 @@ def group_into_trade_contexts(
             "messages": burst_messages,
             "message_indices": assigned["message_indices"],
             "snippet_text": snippet_text,
+            "privacy_map": privacy_map,
             "message_number_map": message_number_map,
             "relevance_score": relevance_score,
         }
@@ -967,26 +998,10 @@ def group_into_trade_contexts(
     return contexts
 
 
-_PHONE_NUMBER_RE = re.compile(
-    r"(?<![A-Z0-9])\+?\d(?:[\d ()-]{6,}\d)(?![A-Z0-9])",
-    re.IGNORECASE,
-)
-
-
-def _context_safe_text(value: Any, private_numbers: List[str]) -> str:
-    text = _clean_message_text(value)
-    for number in private_numbers:
-        if number:
-            text = re.sub(re.escape(number), "[phone]", text, flags=re.IGNORECASE)
-    return _PHONE_NUMBER_RE.sub(
-    lambda m: "[phone]" if sum(ch.isdigit() for ch in m.group(0)) >= 10 else m.group(0),
-    text,
-)
-
-
 def format_context_snippet(
     window: List[Dict[str, Any]],
     group_name: str,
+    placeholder_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     if not window:
         return "", {}
@@ -1015,23 +1030,41 @@ def format_context_snippet(
     for number, message in enumerate(window, start=1):
         message_number_map[f"#{number}"] = message.get("message_id")
         time_text = message["dt"].strftime("%H:%M:%S")
-        sender = _context_safe_text(message.get("sender", ""), private_numbers)
+        sender = _clean_message_text(message.get("sender", ""))
         if message.get("is_own", False):
             sender = f"[OWN] {sender}"
         if message.get("is_media", False):
             body_lines = ["[attachment]"]
         else:
-            body = _context_safe_text(message.get("message_text", ""), private_numbers)
+            body = _clean_message_text(message.get("message_text", ""))
             body_lines = body.splitlines() or [""]
         lines.append(f"#{number} [{time_text}] {sender}: {body_lines[0]}")
         lines.extend(f"    {body_line}" for body_line in body_lines[1:])
 
-        reply = _context_safe_text(message.get("replying_to", ""), private_numbers)
+        reply = _clean_message_text(message.get("replying_to", ""))
         if reply:
             quoted = reply[:200]
             lines.append(f"    replying to: {quoted}")
 
-    return "\n".join(lines), message_number_map
+    snippet = "\n".join(lines)
+    if config.PII_MASKING_ENABLED:
+        person_names = [
+            message.get("sender", "")
+            for message in window
+            if message.get("sender")
+        ]
+        if chat_type == "PRIVATE" and chat_name:
+            person_names.append(chat_name)
+        masked_snippet, mapped_placeholders = privacy.mask_pii(
+            snippet,
+            sender_numbers=private_numbers,
+            person_names=person_names,
+            mask_person_names=config.MASK_PERSON_NAMES,
+        )
+        if placeholder_map is not None:
+            placeholder_map.update(mapped_placeholders)
+        snippet = masked_snippet
+    return snippet, message_number_map
 
 
 # --------------------------------------------------------------------------

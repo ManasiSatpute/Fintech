@@ -11,20 +11,20 @@ Branch with the latest work: `pipeline-improvements`.
 
 ## 1. Where the project stands
 
-**Done (prompts 0 to 10 plus follow-up fixes)**
+**Done (prompts 0 to 10 and 13, plus follow-up fixes)**
 
 - Central settings in `config.py` (every tunable overridable by environment variable).
 - Parser with stable chat identity (`chat_key` from group id / counterpart number), stable message ids, day-first/month-first date detection, no silent `datetime.now()` fallback, reply links and media kept.
 - Noise is tagged, not dropped. Short acknowledgements ("ok", "closed") are never discarded, because they can confirm a trade.
 - Weighted relevance score instead of a hard ISIN gate. Issuer names live in `issuer_aliases.json`.
 - Per-chat grouping where a reply link beats the time gap.
-- Numbered LLM snippet format with quoted replies and phone numbers masked (masks only 10+ digit numbers).
+- Numbered LLM snippets mask contact details before the LLM, while preserving trade data; local placeholders restore model results after validation.
 - `lexicon.json` with English / Hinglish / Marathi trade cues.
 - `normalize.py`: quantity (Cr / L / units / ranges), yield vs coupon, bps, T+n and "Mon VD" settlement dates, maturity parsing, ISIN checksum.
 - New extraction schema (several deals per window, evidence line numbers, nothing defaulted) and validation (evidence check, stricter CONCLUDED rule, confidence, `needs_review`).
 - Partial-ISIN handling: anything that is not a full valid ISIN moves to `partial_isin_text`.
 - Yield cleanup: sign stripped, out-of-range yields (outside about 3 to 25) nulled and flagged, "ISIN - number" treated as units.
-- Last test run: **47 tests passing**.
+- Last test run: **88 tests passing** (plus 13 subtests).
 
 **Not done yet (in order)**
 
@@ -32,11 +32,10 @@ Branch with the latest work: `pipeline-improvements`.
 2. `CANCELLED` handling for explicit refusals (see Known issues, item 2).
 3. **Prompt 11, database schema** (new statuses and fields; `/store` is blocked until this is done).
 4. Prompt 12, API behaviour (remove the 8-context cap, per-context error handling).
-5. Prompt 13, privacy masking before the LLM.
-6. Prompt 14, fuller offline test suite and `scripts/smoke_run.py`.
-7. Prompt 15, UI updates.
-8. Prompt 16, before/after comparison against the saved baseline.
-9. Primary / secondary bond identity ladder and LLM-based context assignment (the mentor's reviews, section 8).
+5. Prompt 14, fuller offline test suite and `scripts/smoke_run.py`.
+6. Prompt 15, UI updates.
+7. Prompt 16, before/after comparison against the saved baseline.
+8. Primary / secondary bond identity ladder and LLM-based context assignment (the mentor's reviews, section 8).
 
 Full details for each are in section 9.
 
@@ -126,7 +125,7 @@ Writes a timestamped JSON report to `baseline/` (git-ignored): message counts by
 | `DAY_FIRST_DEFAULT` | `true` | Date order when a file is ambiguous |
 | `LLM_RETRIES` | `1` | Retries on malformed model output |
 | `MARKET_HOLIDAYS` | empty | ISO dates (comma-separated) skipped when counting business days |
-| `PII_MASKING_ENABLED` | `true` | Mask phone numbers and similar before the model |
+| `PII_MASKING_ENABLED` | `true` | Mask contact details and account fragments before the model |
 | `MASK_PERSON_NAMES` | `false` | Also mask person names |
 | `RELEVANCE_THRESHOLD` | `3` | Minimum relevance score for a window to reach the model |
 | `REVIEW_CONFIDENCE_THRESHOLD` | `0.7` | Below this, a deal is flagged `needs_review` |
@@ -232,7 +231,7 @@ A refusal ("pass", "no sir", "no requirement", "nahi", "rehne do", see `lexicon.
 
 **D. Prompt 12, `app.py`.** Remove the top-8 cap and ISIN-first sorting (process all contexts chronologically). Wrap each context in its own try/except and collect errors with the raw model output. `/extract` returns a full report (messages, media, system, skipped, contexts, skipped_low_relevance, processed, failed, deals by status, `needs_review` count, token usage). Add a TTL for in-memory upload sessions. Pass chat info and message ids through so `/store` links messages through the join table.
 
-**E. Prompt 13, `privacy.py`.** Mask phones, `@numeric` mentions, URLs, emails, bank or account fragments and sender numbers before the model. Do **not** mask ISINs, yields, quantities, dates or RFQ ids. Keep an in-memory placeholder map. Add tests proving trade data survives masking.
+**E. Prompt 13, `privacy.py` (done).** Mask phones, `@numeric` mentions, URLs, emails, bank or account fragments and sender numbers before the model. Person names are optional (`MASK_PERSON_NAMES`, default false). Do **not** mask ISINs, yields, quantities, dates or RFQ ids. Keep an in-memory placeholder map and restore model results locally after validation.
 
 **F. Prompt 14, tests and `scripts/smoke_run.py`.** Offline tests with a mocked LLM and synthetic fixtures (never real data). `smoke_run.py` prints counts only: messages, chats, skipped, media, contexts, reply-linked, unresolved replies, `skipped_low_relevance`, deals by status, `needs_review`, warnings by type.
 

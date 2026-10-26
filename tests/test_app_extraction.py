@@ -150,6 +150,54 @@ class AppExtractionTests(unittest.IsolatedAsyncioTestCase):
             {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         )
 
+    async def test_masked_model_values_are_restored_after_validation(self):
+        upload_id = "masked-upload"
+        app._store_upload_session(upload_id, {
+            "upload_id": upload_id,
+            "parsed_messages": [],
+            "parse_report": {},
+        })
+        masked_context = context("masked", "2026-01-01", "masked snippet")
+        masked_context["privacy_map"] = {"[PII_001]": "Alice"}
+        validation_inputs = []
+
+        def validate(deal, context_snippet, message_datetime):
+            validation_inputs.append((deal, context_snippet))
+            return dict(deal)
+
+        with (
+            patch.object(
+                app.pipeline,
+                "group_into_trade_contexts",
+                return_value=([masked_context], []),
+            ),
+            patch.object(
+                app.pipeline,
+                "call_llm_extraction",
+                return_value=(
+                    {
+                        "deals": [{
+                            "status": "INITIATED",
+                            "buyer_text": "[PII_001]",
+                        }],
+                        "prompt_version": "test",
+                    },
+                    {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                ),
+            ),
+            patch.object(
+                app.pipeline,
+                "validate_extraction",
+                side_effect=validate,
+            ),
+            patch.object(app.pipeline, "get_model_context_length", return_value=100),
+        ):
+            report = await app.extract_trades(upload_id)
+
+        self.assertEqual(validation_inputs[0][0]["buyer_text"], "[PII_001]")
+        self.assertEqual(validation_inputs[0][1], "masked snippet")
+        self.assertEqual(report["extractions"][0]["buyer_text"], "Alice")
+
     def test_upload_session_expires_after_configured_ttl(self):
         with patch.object(app.config, "UPLOAD_SESSION_TTL_SECONDS", 5):
             with patch.object(app.time, "monotonic", return_value=100):

@@ -374,7 +374,12 @@ class JsonlParserTests(unittest.TestCase):
             },
         ]
 
-        snippet, number_map = pipeline.format_context_snippet(messages, "Fallback")
+        privacy_map = {}
+        snippet, number_map = pipeline.format_context_snippet(
+            messages,
+            "Fallback",
+            privacy_map,
+        )
 
         self.assertEqual(
             number_map,
@@ -384,11 +389,16 @@ class JsonlParserTests(unittest.TestCase):
             "Chat: Desk Channel\nType: GROUP\nDate: 2026-07-13"
         ))
         self.assertIn("#1 [10:00:00] [OWN] Alice: First line", snippet)
-        self.assertIn("    Second line [phone]", snippet)
+        self.assertIn("    Second line [PII_", snippet)
         self.assertIn("#2 [10:01:00] Bob: [attachment]", snippet)
         self.assertIn(f"    replying to: {'q' * 200}", snippet)
         self.assertNotIn("120012345678901", snippet)
         self.assertNotIn("919876543210", snippet)
+        self.assertNotIn("9876543210", snippet)
+        self.assertIn(
+            "Second line 9876543210",
+            pipeline.privacy.restore_pii(snippet, privacy_map),
+        )
 
     def test_preserves_fields_and_builds_stable_chat_identity(self):
         rows = [
@@ -468,6 +478,95 @@ class JsonlParserTests(unittest.TestCase):
         self.assertEqual(
             [item["message_id"] for item in messages],
             [item["message_id"] for item in repeated],
+        )
+
+    def test_message_ids_ignore_upload_id_and_distinguish_duplicates(self):
+        samples = [
+            (
+                "[13/07/2026, 10:00:00 AM] Alice: same message\n"
+                "[13/07/2026, 10:00:00 AM] Alice: same message",
+                "plain text",
+            ),
+            (
+                jsonl(
+                    {
+                        "timestamp": "13/07/2026, 10:00:00 AM",
+                        "chat_type": "GROUP",
+                        "group_name": "Unknown group",
+                        "sender_name": "Alice",
+                        "message": "same message",
+                    },
+                    {
+                        "timestamp": "13/07/2026, 10:00:00 AM",
+                        "chat_type": "GROUP",
+                        "group_name": "Unknown group",
+                        "sender_name": "Alice",
+                        "message": "same message",
+                    },
+                ),
+                "unknown group",
+            ),
+        ]
+
+        for content, label in samples:
+            with self.subTest(chat_format=label):
+                first = pipeline.parse_raw_chat_content(
+                    content,
+                    chat_id="upload-one",
+                )
+                second = pipeline.parse_raw_chat_content(
+                    content,
+                    chat_id="upload-two",
+                )
+                first_ids = [message["message_id"] for message in first]
+                second_ids = [message["message_id"] for message in second]
+
+                self.assertEqual(first_ids, second_ids)
+                self.assertEqual(len(first_ids), 2)
+                self.assertNotEqual(first_ids[0], first_ids[1])
+
+    def test_message_ids_ignore_ownership_configuration(self):
+        rows = [
+            {
+                "timestamp": "13/07/2026, 10:00:00 AM",
+                "direction": "INCOMING",
+                "chat_type": "PRIVATE",
+                "sender_name": "Counterparty Name",
+                "sender_number": "1001:2",
+                "receiver_number": "9000:1",
+                "message": "First message",
+            },
+            {
+                "timestamp": "13/07/2026, 10:01:00 AM",
+                "direction": "OUTGOING",
+                "chat_type": "PRIVATE",
+                "sender_name": "Desk User",
+                "sender_number": "9000:3",
+                "receiver_number": "1001:9",
+                "message": "Second message",
+            },
+        ]
+        content = jsonl(*rows)
+
+        with patch.object(pipeline.config, "OWN_SENDER_NAMES", ["Desk User"]):
+            configured, _ = pipeline.parse_raw_chat_content(
+                content,
+                chat_id="configured-upload",
+                return_report=True,
+            )
+        with patch.object(pipeline.config, "OWN_SENDER_NAMES", ["Different User"]):
+            differently_configured, _ = pipeline.parse_raw_chat_content(
+                content,
+                chat_id="other-config-upload",
+                return_report=True,
+            )
+
+        self.assertTrue(configured[1]["is_own"])
+        self.assertFalse(differently_configured[1]["is_own"])
+        self.assertNotEqual(configured[1]["chat_key"], differently_configured[1]["chat_key"])
+        self.assertEqual(
+            [message["message_id"] for message in configured],
+            [message["message_id"] for message in differently_configured],
         )
 
     def test_cleans_text_marks_media_and_reports_skipped_timestamps(self):
