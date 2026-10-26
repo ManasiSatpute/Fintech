@@ -27,7 +27,8 @@ Branch with the latest work: `pipeline-improvements`.
 - Extraction and database views show chat names, status and review badges, confidence, evidence, missing fields, quantities, amounts, settlement details, and report counts.
 - Phase 1 SQLite hardening: versioned in-place migrations, verified per-connection foreign keys, separate identification status, and a duplicate-checked partial unique ISIN index.
 - Phase 2 bond reference index: a configurable external CSV is loaded into immutable in-memory ISIN and issuer indexes; the extraction pipeline does not use it yet.
-- Last test run: **122 tests passing** (plus 15 subtests).
+- Phase 3 source-based ISIN extraction: original message evidence, normalized candidates, structure and checksum validation; no pipeline integration or bond matching.
+- Last test run: **134 tests passing** (plus 20 subtests).
 
 **Not done yet (in order)**
 
@@ -242,6 +243,12 @@ A refusal ("pass", "no sir", "no requirement", "nahi", "rehne do", see `lexicon.
 - Exact ISIN lookup normalizes case and whitespace. Issuer candidate retrieval normalizes Unicode, case and whitespace. Original values remain available separately from normalized lookup keys.
 - Duplicate identifiers are counted. Identical rows remain lookupable; conflicting rows return no single-record ISIN match and remain available as candidates for review. Missing headers, unreadable files, and files with no valid records raise `BondReferenceError`.
 - This phase does not make identification decisions or connect to the extraction pipeline.
+
+**Phase 3 source-based ISIN extraction and validation (`isin_utils.py`, implemented).**
+- Extract ISIN-shaped candidates from one original WhatsApp message, retain the raw candidate and source-message span, normalize case and whitespace/hyphen separators, then validate ISO 6166 structure and checksum.
+- Results distinguish no identifier, one valid identifier, invalid format, checksum failure, multiple candidates, and an LLM candidate unsupported by its supplied source evidence. Multiple candidates are never resolved by selecting one.
+- LLM candidates are checked against the original message and, if supplied, only explicitly linked messages with evidence referring back to the original message. Callers must not pass an unfiltered chat window.
+- This module does not perform bond matching, persist records, or integrate into extraction.
 
 **E. Prompt 12, `app.py`.** Remove the top-8 cap and ISIN-first sorting (process all contexts chronologically). Wrap each context in its own try/except and collect errors with the raw model output. `/extract` returns a full report (messages, media, system, skipped, contexts, skipped_low_relevance, processed, failed, deals by status, `needs_review` count, token usage). Add a TTL for in-memory upload sessions. Pass chat info and message ids through so `/store` links messages through the join table.
 
