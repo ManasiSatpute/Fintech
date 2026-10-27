@@ -1,8 +1,8 @@
 chat_no_deal.txt -> No deal extracted; agent returns {} or the pipeline skips.
 chat_single_deal.txt -> {
   "bond": "6.65% GS 2026",
-  "buyer": "Manasi Satpute",
-  "seller": "Manasi",
+  "buyer": "Person 01",
+  "seller": "Person 01",
   "price": 6.465,
   "deal_time": "2026-08-11 15:02:53",
   "deal_type": "buy"
@@ -10,8 +10,8 @@ chat_single_deal.txt -> {
 
 chat_multiple_deals.txt -> Two records stored:
 
-Deal 1: bond 7.18% SDL 2028, seller Raj, buyer Priya, price 7.245, amount 5 Cr, deal_type sell (from Raj's perspective) or buy (from Priya's). The agent should pick one perspective consistently.
-Deal 2: bond 6.79% GS 2027, buyer Raj, seller Priya, price 6.795, amount 2 Cr, deal_type buy.
+Deal 1: bond 7.18% SDL 2028, seller Person 23, buyer Person 21, price 7.245, amount 5 Cr, deal_type sell (from Person 23's perspective) or buy (from Person 21's). The agent should pick one perspective consistently.
+Deal 2: bond 6.79% GS 2027, buyer Person 23, seller Person 21, price 6.795, amount 2 Cr, deal_type buy.
 
 chat_noise_and_deal.txt -> One deal extracted despite the initial small talk.
 chat_ambiguous.txt -> No deal stored because neither party explicitly said “done” or “confirmed”. The agent should return is_deal_confirmed: false or an empty object.

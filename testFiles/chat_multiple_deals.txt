@@ -1,15 +1,15 @@
 [11/08/26, 9:00:00 AM] Chat: ‎Messages and calls are end-to-end encrypted.
-[11/08/26, 9:00:10 AM] Raj: Good morning
-[11/08/26, 9:00:15 AM] Priya: Morning
-[11/08/26, 9:01:00 AM] Raj: I have 5Cr 7.18 SDL 2028 to sell
-[11/08/26, 9:01:10 AM] Priya: price?
-[11/08/26, 9:01:15 AM] Raj: 7.25
-[11/08/26, 9:01:20 AM] Priya: 7.24?
-[11/08/26, 9:01:25 AM] Raj: done at 7.245
-[11/08/26, 9:01:30 AM] Priya: done
-[11/08/26, 9:30:00 AM] Raj: also looking to buy 2Cr 6.79 GS 2027
-[11/08/26, 9:30:10 AM] Priya: I can sell at 6.80
-[11/08/26, 9:30:15 AM] Raj: 6.79?
-[11/08/26, 9:30:20 AM] Priya: meet at 6.795
-[11/08/26, 9:30:25 AM] Raj: done
-[11/08/26, 9:30:30 AM] Priya: done
+[11/08/26, 9:00:10 AM] Person 23: Good morning
+[11/08/26, 9:00:15 AM] Person 21: Morning
+[11/08/26, 9:01:00 AM] Person 23: I have 5Cr 7.18 SDL 2028 to sell
+[11/08/26, 9:01:10 AM] Person 21: price?
+[11/08/26, 9:01:15 AM] Person 23: 7.25
+[11/08/26, 9:01:20 AM] Person 21: 7.24?
+[11/08/26, 9:01:25 AM] Person 23: done at 7.245
+[11/08/26, 9:01:30 AM] Person 21: done
+[11/08/26, 9:30:00 AM] Person 23: also looking to buy 2Cr 6.79 GS 2027
+[11/08/26, 9:30:10 AM] Person 21: I can sell at 6.80
+[11/08/26, 9:30:15 AM] Person 23: 6.79?
+[11/08/26, 9:30:20 AM] Person 21: meet at 6.795
+[11/08/26, 9:30:25 AM] Person 23: done
+[11/08/26, 9:30:30 AM] Person 21: done

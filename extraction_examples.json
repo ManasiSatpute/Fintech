@@ -1,0 +1,419 @@
+[
+  {
+    "conversation": "Chat: Synthetic Desk\nType: GROUP\nDate: 2026-10-01\n#1 [09:00:00] [OWN] Desk: Offering 7.25% Example Issuer NCD 2030 and 7.40% Example Issuer NCD 2032 at 8.10, 5 cr each",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": "7.25% Example Issuer NCD 2030",
+          "isin_text": null,
+          "issuer_text": "Example Issuer",
+          "maturity_text": "2030",
+          "coupon_rate": 7.25,
+          "credit_rating": null,
+          "quantity_text": "5 cr",
+          "ytm": "8.10",
+          "ytm_is_two_way": false,
+          "price": null,
+          "settlement_text": null,
+          "owner_side": "SELL",
+          "buyer_text": null,
+          "seller_text": "Desk",
+          "rfq_id": null,
+          "package_note": "One yield and quantity apply to both bonds",
+          "is_indicative": true,
+          "status": "INITIATED",
+          "status_evidence": "Offering",
+          "discard_reason": null,
+          "evidence": {
+            "bond_identity_text": ["#1"],
+            "issuer_text": ["#1"],
+            "maturity_text": ["#1"],
+            "coupon_rate": ["#1"],
+            "quantity_text": ["#1"],
+            "ytm": ["#1"],
+            "seller_text": ["#1"],
+            "package_note": ["#1"],
+            "is_indicative": ["#1"],
+            "status": ["#1"],
+            "status_evidence": ["#1"]
+          }
+        },
+        {
+          "bond_identity_text": "7.40% Example Issuer NCD 2032",
+          "isin_text": null,
+          "issuer_text": "Example Issuer",
+          "maturity_text": "2032",
+          "coupon_rate": 7.4,
+          "credit_rating": null,
+          "quantity_text": "5 cr",
+          "ytm": "8.10",
+          "ytm_is_two_way": false,
+          "price": null,
+          "settlement_text": null,
+          "owner_side": "SELL",
+          "buyer_text": null,
+          "seller_text": "Desk",
+          "rfq_id": null,
+          "package_note": "One yield and quantity apply to both bonds",
+          "is_indicative": true,
+          "status": "INITIATED",
+          "status_evidence": "Offering",
+          "discard_reason": null,
+          "evidence": {
+            "bond_identity_text": ["#1"],
+            "issuer_text": ["#1"],
+            "maturity_text": ["#1"],
+            "coupon_rate": ["#1"],
+            "quantity_text": ["#1"],
+            "ytm": ["#1"],
+            "seller_text": ["#1"],
+            "package_note": ["#1"],
+            "is_indicative": ["#1"],
+            "status": ["#1"],
+            "status_evidence": ["#1"]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: GROUP\nDate: 2026-10-01\n#1 [10:00:00] Trader A: Offering 6.80% Example Finance NCD 2031, 4 cr at 10.20\n#2 [10:02:00] Trader B: Can take at 10.10, T+1\n#3 [10:04:00] [OWN] Desk: ok lets close at 10.08, T+1\n#4 [10:05:00] Trader A: closed",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": "6.80% Example Finance NCD 2031",
+          "isin_text": null,
+          "issuer_text": "Example Finance",
+          "maturity_text": "2031",
+          "coupon_rate": 6.8,
+          "credit_rating": null,
+          "quantity_text": "4 cr",
+          "ytm": "10.08",
+          "ytm_is_two_way": false,
+          "price": null,
+          "settlement_text": "T+1",
+          "owner_side": "BUY",
+          "buyer_text": "Trader B",
+          "seller_text": "Trader A",
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": false,
+          "status": "CONCLUDED",
+          "status_evidence": "Trader A: closed",
+          "discard_reason": null,
+          "evidence": {
+            "bond_identity_text": ["#1"],
+            "issuer_text": ["#1"],
+            "maturity_text": ["#1"],
+            "coupon_rate": ["#1"],
+            "quantity_text": ["#1"],
+            "ytm": ["#3"],
+            "settlement_text": ["#2", "#3"],
+            "owner_side": ["#2"],
+            "buyer_text": ["#2"],
+            "seller_text": ["#1"],
+            "is_indicative": ["#3"],
+            "status": ["#4"],
+            "status_evidence": ["#4"]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: PRIVATE\nDate: 2026-10-01\n#1 Trader A: Offering 7.10% Example Capital NCD 2030 at 9.00\n#2 [OWN] Desk: pass on your offer",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": "7.10% Example Capital NCD 2030",
+          "isin_text": null,
+          "issuer_text": "Example Capital",
+          "maturity_text": "2030",
+          "coupon_rate": 7.1,
+          "credit_rating": null,
+          "quantity_text": null,
+          "ytm": "9.00",
+          "ytm_is_two_way": false,
+          "price": null,
+          "settlement_text": null,
+          "owner_side": "SELL",
+          "buyer_text": null,
+          "seller_text": "Trader A",
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": true,
+          "status": "CANCELLED",
+          "status_evidence": "pass on your offer",
+          "discard_reason": null,
+          "evidence": {
+            "bond_identity_text": ["#1"],
+            "issuer_text": ["#1"],
+            "maturity_text": ["#1"],
+            "coupon_rate": ["#1"],
+            "ytm": ["#1"],
+            "owner_side": ["#1"],
+            "seller_text": ["#1"],
+            "is_indicative": ["#1"],
+            "status": ["#2"],
+            "status_evidence": ["#2"]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: PRIVATE\nDate: 2026-10-01\n#1 [OWN] Desk: payment allocation validate reported accepted, ata kela",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": null,
+          "isin_text": null,
+          "issuer_text": null,
+          "maturity_text": null,
+          "coupon_rate": null,
+          "credit_rating": null,
+          "quantity_text": null,
+          "ytm": null,
+          "ytm_is_two_way": null,
+          "price": null,
+          "settlement_text": null,
+          "owner_side": null,
+          "buyer_text": null,
+          "seller_text": null,
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": null,
+          "status": "DISCARDED",
+          "status_evidence": "payment allocation validate reported accepted",
+          "discard_reason": "Operational payment and allocation status, not a trade",
+          "evidence": {
+            "status": ["#1"],
+            "status_evidence": ["#1"],
+            "discard_reason": ["#1"]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: PRIVATE\nDate: 2026-10-01\n#1 [OWN] Desk: Offering Synthetic Bond at 10.08 for 5 cr\n#2 Trader A: no requirement",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": "Synthetic Bond",
+          "isin_text": null,
+          "issuer_text": null,
+          "maturity_text": null,
+          "coupon_rate": null,
+          "credit_rating": null,
+          "quantity_text": "5 cr",
+          "ytm": "10.08",
+          "ytm_is_two_way": false,
+          "price": null,
+          "settlement_text": null,
+          "owner_side": "SELL",
+          "buyer_text": null,
+          "seller_text": "Desk",
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": true,
+          "status": "CANCELLED",
+          "status_evidence": "no requirement",
+          "discard_reason": null,
+          "evidence": {
+            "bond_identity_text": ["#1"],
+            "quantity_text": ["#1"],
+            "ytm": ["#1"],
+            "owner_side": ["#1"],
+            "seller_text": ["#1"],
+            "is_indicative": ["#1"],
+            "status": ["#2"],
+            "status_evidence": ["#2"]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: PRIVATE\nDate: 2026-10-01\n#1 [OWN] Desk: offer pls",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": null,
+          "isin_text": null,
+          "issuer_text": null,
+          "maturity_text": null,
+          "coupon_rate": null,
+          "credit_rating": null,
+          "quantity_text": null,
+          "ytm": null,
+          "ytm_is_two_way": null,
+          "price": null,
+          "settlement_text": null,
+          "owner_side": "BUY",
+          "buyer_text": "Desk",
+          "seller_text": null,
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": true,
+          "status": "INITIATED",
+          "status_evidence": "offer pls",
+          "discard_reason": null,
+          "evidence": {
+            "owner_side": ["#1"],
+            "buyer_text": ["#1"],
+            "is_indicative": ["#1"],
+            "status": ["#1"],
+            "status_evidence": ["#1"]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: PRIVATE\nDate: 2026-10-01\n#1 [OWN] Desk: 10% offer",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": null,
+          "isin_text": null,
+          "issuer_text": null,
+          "maturity_text": null,
+          "coupon_rate": null,
+          "credit_rating": null,
+          "quantity_text": null,
+          "ytm": null,
+          "ytm_is_two_way": null,
+          "price": null,
+          "settlement_text": null,
+          "owner_side": "SELL",
+          "buyer_text": null,
+          "seller_text": "Desk",
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": true,
+          "status": "INITIATED",
+          "status_evidence": "10% offer",
+          "discard_reason": null,
+          "evidence": {
+            "owner_side": ["#1"],
+            "seller_text": ["#1"],
+            "is_indicative": ["#1"],
+            "status": ["#1"],
+            "status_evidence": ["#1"]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: PRIVATE\nDate: 2026-10-01\n#1 [OWN] Desk: bid pls",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": null,
+          "isin_text": null,
+          "issuer_text": null,
+          "maturity_text": null,
+          "coupon_rate": null,
+          "credit_rating": null,
+          "quantity_text": null,
+          "ytm": null,
+          "ytm_is_two_way": null,
+          "price": null,
+          "settlement_text": null,
+          "owner_side": "SELL",
+          "buyer_text": null,
+          "seller_text": "Desk",
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": true,
+          "status": "INITIATED",
+          "status_evidence": "bid pls",
+          "discard_reason": null,
+          "evidence": {
+            "owner_side": ["#1"],
+            "seller_text": ["#1"],
+            "is_indicative": ["#1"],
+            "status": ["#1"],
+            "status_evidence": ["#1"]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: PRIVATE\nDate: 2026-10-01\n#1 [OWN] Desk: bid at 10.08",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": null,
+          "isin_text": null,
+          "issuer_text": null,
+          "maturity_text": null,
+          "coupon_rate": null,
+          "credit_rating": null,
+          "quantity_text": null,
+          "ytm": "10.08",
+          "ytm_is_two_way": false,
+          "price": null,
+          "settlement_text": null,
+          "owner_side": "BUY",
+          "buyer_text": "Desk",
+          "seller_text": null,
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": false,
+          "status": "INITIATED",
+          "status_evidence": "bid at 10.08",
+          "discard_reason": null,
+          "evidence": {
+            "ytm": ["#1"],
+            "owner_side": ["#1"],
+            "buyer_text": ["#1"],
+            "is_indicative": ["#1"],
+            "status": ["#1"],
+            "status_evidence": ["#1"]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "conversation": "Chat: Synthetic Desk\nType: PRIVATE\nDate: 2026-10-01\n#1 [OWN] Desk: ZZ0000000000 43 units T+1",
+    "expected": {
+      "deals": [
+        {
+          "bond_identity_text": null,
+          "isin_text": "ZZ0000000000",
+          "issuer_text": null,
+          "maturity_text": null,
+          "coupon_rate": null,
+          "credit_rating": null,
+          "quantity_text": "43 units",
+          "ytm": null,
+          "ytm_is_two_way": null,
+          "price": null,
+          "settlement_text": "T+1",
+          "owner_side": "UNKNOWN",
+          "buyer_text": null,
+          "seller_text": null,
+          "rfq_id": null,
+          "package_note": null,
+          "is_indicative": null,
+          "status": "INITIATED",
+          "status_evidence": "ZZ0000000000 43 units T+1",
+          "discard_reason": null,
+          "evidence": {
+            "isin_text": ["#1"],
+            "quantity_text": ["#1"],
+            "settlement_text": ["#1"],
+            "owner_side": ["#1"],
+            "status": ["#1"],
+            "status_evidence": ["#1"]
+          }
+        }
+      ]
+    }
+  }
+]

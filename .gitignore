@@ -11,9 +11,24 @@ __pycache__/
 # Databases (generated at runtime)
 *.db
 Whatsaapp_to_Sql*
+/baseline/
+/data/*
+!/data/README.md
 
 # Private data
-chat_2.txt
+.env
+.env.*
+!.env.example
+/uploads/
+/chat_*.txt
+*.jsonl
+*whatsapp*.txt
+*WhatsApp*Chat*.txt
 
 # OS / editor
 .DS_Store
+.github/
+AGENTS.md
+
+# CSV Files
+ISIN_DETAILS.csv

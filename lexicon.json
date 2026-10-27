@@ -1,0 +1,123 @@
+{
+  "agreement": [
+    "done",
+    "closed",
+    "confirmed",
+    "done hai",
+    "ho gaya",
+    "pakka",
+    "final",
+    "ok lets close",
+    "ata kela",
+    "zala",
+    "karun takla",
+    "laga diya"
+  ],
+  "ack_only": [
+    "ok",
+    "okay",
+    "sure",
+    "haan",
+    "theek hai",
+    "np",
+    "s"
+  ],
+  "pass_or_refusal": [
+    "pass",
+    "no sir",
+    "no requirement",
+    "nahi",
+    "rehne do"
+  ],
+  "pending": [
+    "checking",
+    "working on it",
+    "approval pending",
+    "let me check",
+    "ruk jao"
+  ],
+  "relative_days": [
+    "today",
+    "aaj",
+    "tomorrow",
+    "tom",
+    "kal",
+    "parso",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "vd"
+  ],
+  "buy_cues": [
+    "need",
+    "required",
+    "bid",
+    "lena hai",
+    "chahiye"
+  ],
+  "sell_cues": [
+    "offer",
+    "sell",
+    "dena hai"
+  ],
+  "question_cues": [
+    "any bids?",
+    "any offer?",
+    "can close?",
+    "accpt nh krt ka"
+  ],
+  "buyer_request_cues": [
+    "offer pls",
+    "offer please",
+    "need offer",
+    "any offer?",
+    "offers?"
+  ],
+  "seller_request_cues": [
+    "bid pls",
+    "bid please",
+    "any bids?",
+    "bids?"
+  ],
+  "seller_offer_cues": [
+    "offer at",
+    "i have an offer"
+  ],
+  "buyer_bid_cues": [
+    "bid at",
+    "i have a bid"
+  ],
+  "marathi_hinglish_done": [
+    "ata kela",
+    "ho gaya",
+    "pakka",
+    "zala",
+    "karun takla",
+    "laga diya"
+  ],
+  "marathi_hinglish_ask": [
+    "accpt nh krt ka",
+    "karta ka",
+    "milel ka",
+    "karu ka"
+  ],
+  "marathi_hinglish_status": [
+    "karto",
+    "karte",
+    "baghto",
+    "check karto",
+    "ruk jao",
+    "working on it"
+  ],
+  "needs_context": [
+    "do",
+    "lo",
+    "s",
+    "yes",
+    "no"
+  ]
+}
