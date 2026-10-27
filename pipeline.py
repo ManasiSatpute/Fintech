@@ -137,9 +137,7 @@ def format_lexicon_glossary() -> str:
     )
     return " | ".join(sections)
 
-# --------------------------------------------------------------------------
 # 1. PARSING RAW CHAT EXPORTS (TXT & JSON)
-# --------------------------------------------------------------------------
 
 # iOS format: [11/08/26, 3:00:27 PM] Sender: Message
 LINE_RE_IOS = re.compile(
@@ -567,9 +565,7 @@ def parse_raw_chat_content(
     return (messages, parse_report) if return_report else messages
 
 
-# --------------------------------------------------------------------------
 # 2. NOISE FILTER & ROUTING
-# --------------------------------------------------------------------------
 
 SYSTEM_SENDERS = {"Chat", "System"}
 _SYSTEM_NAME = r"[^\W\d_][\w .'-]*"
@@ -779,9 +775,7 @@ def get_noise_label(msg: Dict[str, Any]) -> str:
     return "none"
 
 
-# --------------------------------------------------------------------------
 # 3. GROUPING INTO TRADE CONTEXTS
-# --------------------------------------------------------------------------
 
 WINDOW_GAP = timedelta(minutes=config.GAP_MINUTES)
 
@@ -1071,9 +1065,7 @@ def format_context_snippet(
     return snippet, message_number_map
 
 
-# --------------------------------------------------------------------------
 # 4. LLM EXTRACTION & TOKEN / CONTEXT METRICS
-# --------------------------------------------------------------------------
 
 PROMPT_VERSION = "bond-extraction-v2"
 EXTRACTION_STATUSES = {
@@ -1302,9 +1294,7 @@ def call_llm_extraction(
     }, token_metrics
 
 
-# --------------------------------------------------------------------------
 # 5. BUSINESS RULE VALIDATION
-# --------------------------------------------------------------------------
 
 _EVIDENCE_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
 _NUMBER_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)?")
