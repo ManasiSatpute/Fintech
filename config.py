@@ -66,6 +66,31 @@ REVIEW_CONFIDENCE_THRESHOLD = float(
 if not 0.0 <= REVIEW_CONFIDENCE_THRESHOLD <= 1.0:
     raise ValueError("REVIEW_CONFIDENCE_THRESHOLD must be between 0 and 1")
 
+# Dynamic Deal Stacking Thresholds
+STACK_HIGH_CONFIDENCE_THRESHOLD = float(
+    os.getenv("STACK_HIGH_CONFIDENCE_THRESHOLD", "0.65")
+)
+if not 0.0 <= STACK_HIGH_CONFIDENCE_THRESHOLD <= 1.0:
+    raise ValueError("STACK_HIGH_CONFIDENCE_THRESHOLD must be between 0 and 1")
+
+STACK_NEW_NEGOTIATION_THRESHOLD = float(
+    os.getenv("STACK_NEW_NEGOTIATION_THRESHOLD", "0.30")
+)
+if not 0.0 <= STACK_NEW_NEGOTIATION_THRESHOLD <= 1.0:
+    raise ValueError("STACK_NEW_NEGOTIATION_THRESHOLD must be between 0 and 1")
+
+STACK_AMBIGUITY_DELTA_THRESHOLD = float(
+    os.getenv("STACK_AMBIGUITY_DELTA_THRESHOLD", "0.15")
+)
+if not 0.0 <= STACK_AMBIGUITY_DELTA_THRESHOLD <= 1.0:
+    raise ValueError("STACK_AMBIGUITY_DELTA_THRESHOLD must be between 0 and 1")
+
+STACK_TIME_DECAY_HOURS = float(
+    os.getenv("STACK_TIME_DECAY_HOURS", "4.0")
+)
+if STACK_TIME_DECAY_HOURS <= 0.0:
+    raise ValueError("STACK_TIME_DECAY_HOURS must be greater than 0")
+
 ALLOWED_ORIGINS = _list_setting(
     "ALLOWED_ORIGINS",
     [
