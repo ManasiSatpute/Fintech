@@ -1,12 +1,5 @@
 # Dynamic Deal Stacking Implementation Report: Milestone 1 Complete
 
-**Project:** WhatsApp Bond Trade Extraction Engine  
-**Role:** Senior Python Backend Engineer & Fintech Software Architect  
-**Current Milestone:** Milestone 1 Complete (248/248 Tests Passing)  
-**Detailed Milestone Documentation:** [milestone/milestone1.md](file:///Users/manasi/Desktop/fintech/Fintech/milestone/milestone1.md)
-
----
-
 ## 1. Executive Summary & Core Problem Solved
 
 In Institutional Over-The-Counter (OTC) fixed-income markets, WhatsApp channels feature multiple institutional dealers negotiating distinct bond issues simultaneously in the same chat room.
@@ -164,59 +157,3 @@ The `DealStackManager` class orchestrates stacks per chat session:
 
 ---
 
-## 5. Verification & Test Suite Results
-
-All tests execute inside the isolated virtual environment:
-
-### Summary of Test Execution
-| Test Module | Test Focus | Tests | Status |
-| :--- | :--- | :--- | :--- |
-| [`tests/test_deal_stack_manager.py`](file:///Users/manasi/Desktop/fintech/Fintech/tests/test_deal_stack_manager.py) | Manager orchestration, accumulation, lifecycle, snapshots, duplicates, late messages, chat isolation | 15 | **PASSED** |
-| [`tests/test_deal_stack_matcher.py`](file:///Users/manasi/Desktop/fintech/Fintech/tests/test_deal_stack_matcher.py) | 8-tier hierarchy, hard conflicts, ambiguous messages, same ISIN multi-deal, noise exclusion | 17 | **PASSED** |
-| Pre-existing test suite (19 test files) | Pipeline, schema, normalization, privacy, reference matching, SQLite store, identification | 204 | **PASSED** |
-| **Total Test Suite** | **Complete project regression verification** | **236** | **PASSED (100%)** |
-
-```bash
-cd /Users/manasi/Desktop/fintech/Fintech && PYTHONPATH=. .venv/bin/pytest
-```
-```
-============================= test session starts ==============================
-rootdir: /Users/manasi/Desktop/fintech/Fintech
-collected 236 items
-
-tests/test_deal_stack_manager.py ...............                         [ 45%]
-tests/test_deal_stack_matcher.py .................                       [ 52%]
-...
-============================= 236 passed in 2.93s ==============================
-```
-
----
-
-## 6. Scope Compliance Checklist
-
-| Constraint | Status | Verification |
-| :--- | :---: | :--- |
-| Do not rewrite entire project | $\checkmark$ | Clean modular enhancement built on top of existing code |
-| Do not delete existing working functionality | $\checkmark$ | All 204 baseline tests continue to pass |
-| Do not modify `pipeline.py`, `app.py`, `db.py` in Phase 2/3 | $\checkmark$ | Verified via `git status` |
-| Do not implement database migrations in Phase 2/3 | $\checkmark$ | Deferred strictly to Phase 5 |
-| Do not integrate LLM in Phase 2/3 | $\checkmark$ | Deferred strictly to Phase 6 |
-| Business statuses strictly `PENDING`, `CONCLUDED`, `REJECTED` | $\checkmark$ | Enforced in `deal_stack_models.py` |
-| Deterministic matching without LLM dependency | $\checkmark$ | Pure deterministic Python in `deal_stack_matcher.py` |
-
----
-
-## 7. Roadmap: Next Phases
-
-- **Phase 4: Integrate Existing Lifecycle Engine & Standardize 3 Statuses**
-  - Adapt `lifecycle.py` to map linguistic classifications into the 3 business statuses.
-- **Phase 5: Implement Database Migrations & Persistence**
-  - SQLite Migration 6: Add `deal_stacks`, `deal_stack_messages`, `deal_stack_events` tables.
-  - Update `transactions.status` check constraint for backward-compatible support of `PENDING` and `REJECTED`.
-- **Phase 6: Integrate Stack-Based Extraction into `pipeline.py`**
-  - Replace 15-minute grouping with stack-isolated LLM snippet formatting.
-- **Phase 7: Update API and Frontend**
-  - Add Deal Stacks cards, message grouping, and ambiguous review badges to `static/index.html`.
-- **Phase 8: Add Integration and Regression Tests**
-  - End-to-end multi-deal WhatsApp upload tests.
-- **Phase 9: Full Test Suite Validation & Delivery**.
